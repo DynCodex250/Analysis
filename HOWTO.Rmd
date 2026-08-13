@@ -1,0 +1,404 @@
+---
+title: "D365FO Licensing & Security Analysis - Ausführungs- und Test-Anleitung"
+subtitle: "Schritt-für-Schritt: Setup, Tests, produktiver Lauf"
+date: "`r format(Sys.Date(), '%d.%m.%Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE)
+# eval = FALSE ist bewusst gesetzt: dieses Dokument dient als ausführbare
+# Anleitung/Referenz. Einzelne Chunks kannst du in RStudio mit Strg+Enter /
+# Cmd+Enter gezielt manuell ausführen (eval lokal auf TRUE überschreiben),
+# statt das gesamte Dokument automatisch zu knitten.
+```
+
+# Voraussetzungen
+
+Bevor es losgeht, kurz prüfen, dass alles vorhanden ist:
+
+- **R** (Version ≥ 4.1 empfohlen) und idealerweise **RStudio**.
+- Das Projektverzeichnis `d365-licensing-analysis/` (aus dem vorherigen Schritt), entpackt an einem Ort deiner Wahl.
+- Eine gültige `db_credentials.xlsx` bzw. die bestehende `get_connection()`-Funktion aus deinem D365FO-Projekt.
+- Optional, nur für Telemetrie: ein Application Insights App ID + API Key.
+
+```{r check-r-version}
+R.version.string
+getRversion()
+```
+
+## 1.1 Pakete installieren
+
+Diese Pakete werden von der Pipeline verwendet:
+
+```{r install-packages}
+required_pkgs <- c(
+  "yaml", "DBI", "httr2", "writexl", "readxl", "dplyr", "data.table",
+  "testthat"
+)
+
+missing_pkgs <- setdiff(required_pkgs, rownames(installed.packages()))
+if (length(missing_pkgs) > 0) {
+  install.packages(missing_pkgs)
+} else {
+  message("Alle benötigten Pakete sind bereits installiert.")
+}
+```
+
+Falls dein Projekt zusätzlich einen DB-Treiber benötigt (z. B. `odbc` für SQL
+Server), diesen ebenfalls installieren - das hängt davon ab, wie deine
+bestehende `get_connection()`-Funktion die Verbindung aufbaut.
+
+```{r install-odbc-optional}
+# Nur falls get_connection() odbc/RODBC verwendet:
+# install.packages("odbc")
+```
+
+## 1.2 Arbeitsverzeichnis setzen
+
+Passe den Pfad einmalig an dein System an:
+
+```{r set-wd}
+project_root <- "PFAD/ZU/d365-licensing-analysis"   # <-- anpassen!
+setwd(project_root)
+getwd()
+```
+
+```{r check-structure}
+list.files(project_root)
+# erwartet: R, config, sql, kql, tests, data, reports, README.md
+```
+
+---
+
+# Schritt 1: Konfiguration prüfen und lokal anpassen
+
+Die Pipeline liest **keine** Zugangsdaten aus dem Repository selbst. Lokale,
+nicht zu committende Overrides gehören in `config/config.local.yml`.
+
+```{r inspect-config}
+cat(readLines(file.path(project_root, "config", "config.yml")), sep = "\n")
+```
+
+## 1.1 Lokale Override-Datei anlegen (empfohlen)
+
+```{r create-local-config}
+local_cfg_path <- file.path(project_root, "config", "config.local.yml")
+
+if (!file.exists(local_cfg_path)) {
+  local_cfg <- c(
+    "default:",
+    "  connection:",
+    "    credentials_path: \"C:/Users/DEIN_USER/Documents/RProjects/D365_Admin/db_credentials.xlsx\"",
+    "  telemetry:",
+    "    enabled: true",
+    "    telemetry_days: 90        # zum Testen klein halten, produktiv z.B. 700",
+    "    app_insights_env_var: \"D365_APPINSIGHTS_APP_ID\"",
+    "    api_key_env_var: \"D365_APPINSIGHTS_API_KEY\""
+  )
+  writeLines(local_cfg, local_cfg_path)
+  message("config.local.yml angelegt unter: ", local_cfg_path)
+} else {
+  message("config.local.yml existiert bereits, wird nicht überschrieben.")
+}
+```
+
+**Wichtig:** `config.local.yml` steht bereits in `.gitignore` - sie wird nie
+versehentlich eingecheckt.
+
+## 1.2 Application-Insights-Zugangsdaten als Umgebungsvariablen setzen
+
+Telemetrie ist optional. Wenn du sie nutzen willst, setze die beiden Env-Vars
+(z. B. in `~/.Renviron`, damit sie bei jedem R-Start automatisch geladen
+werden - **niemals** im Skript oder Repo hart codieren):
+
+```{r renviron-hint}
+usethis_hint <- "
+# In ~/.Renviron (mit usethis::edit_r_environ() öffnen):
+D365_APPINSIGHTS_APP_ID=dein-app-insights-app-id
+D365_APPINSIGHTS_API_KEY=dein-api-key
+"
+cat(usethis_hint)
+```
+
+```{r set-env-session, eval=FALSE}
+# Alternative nur für die aktuelle R-Sitzung (nicht persistent):
+Sys.setenv(D365_APPINSIGHTS_APP_ID = "dein-app-insights-app-id")
+Sys.setenv(D365_APPINSIGHTS_API_KEY = "dein-api-key")
+```
+
+Wenn diese Variablen fehlen, läuft die Pipeline trotzdem durch - Telemetrie-
+Findings werden dann korrekt als `UNKNOWN` markiert (siehe FINDING-010),
+nichts bricht ab.
+
+---
+
+# Schritt 2: `get_connection()` verfügbar machen
+
+Die Pipeline ruft eure bestehende `get_connection(environment,
+credentials_path)`-Funktion auf. Sie muss **vor** `run_analysis()` in der
+R-Session geladen sein.
+
+```{r source-get-connection}
+# Passe den Pfad zu eurer bestehenden Connection-Datei an, z.B.:
+source("PFAD/ZU/EUREM/PROJEKT/connection_helpers.R")
+
+# Sanity-Check: Funktion muss jetzt existieren
+exists("get_connection", mode = "function")
+```
+
+```{r test-connection-manually}
+# Manueller Verbindungstest, unabhängig von der Pipeline:
+cnn <- get_connection("PRJ", "PFAD/ZU/db_credentials.xlsx")
+DBI::dbGetQuery(cnn, "SELECT TOP 1 ID FROM USERINFO")
+DBI::dbDisconnect(cnn)
+```
+
+Wenn dieser Chunk erfolgreich läuft, ist die DB-Verbindung grundsätzlich in
+Ordnung und du kannst zu den Tests übergehen.
+
+---
+
+# Schritt 3: Unit-Tests laufen lassen (ohne Live-DB)
+
+Die Tests in `tests/testthat/` benötigen **keine** Datenbankverbindung - sie
+prüfen die Join- und Klassifikationslogik gegen Fixture-Daten direkt in R.
+Das ist der schnellste Weg, um zu prüfen, ob die Pipeline grundsätzlich
+funktionsfähig ist, bevor überhaupt eine echte Umgebung angebunden wird.
+
+## 3.1 Gesamten Testlauf starten
+
+```{r run-tests}
+library(testthat)
+setwd(project_root)   # sicherstellen, dass wir im Projekt-Root stehen
+test_results <- test_dir("tests/testthat", reporter = "summary")
+test_results
+```
+
+Erwartetes Ergebnis: alle Tests **grün** (`PASS`). Falls Tests fehlschlagen,
+gibt `testthat` genau an, welche `expect_*()`-Zeile in welcher Datei
+fehlgeschlagen ist - das zeigt in der Regel direkt an, ob z. B. eine
+Spaltenbezeichnung in deiner realen `USERSECGOVRELATEDOBJECTS`-Struktur von
+den Testannahmen abweicht.
+
+## 3.2 Nur einen einzelnen Testbereich laufen lassen
+
+Praktisch beim gezielten Debuggen:
+
+```{r run-single-test-file}
+test_file(file.path(project_root, "tests/testthat/test-security-structure.R"))
+```
+
+```{r run-single-test-file-2}
+test_file(file.path(project_root, "tests/testthat/test-role-classification.R"))
+```
+
+## 3.3 Was die Tests konkret abdecken
+
+| Testdatei | Prüft |
+|---|---|
+| `test-users.R` | USERINFO/SYSUSERINVALIDUSERS-Join, Application-User-Klassifikation |
+| `test-security-structure.R` | Role→Duty→Privilege→EntryPoint-Join, Access-Level-Klassifikation, Rollenmetriken |
+| `test-role-classification.R` | Service- vs. Business-Rollen-Logik, System-Administrator-Sonderfall |
+| `test-confidence-and-findings.R` | Confidence-Scoring, FINDING-001 und FINDING-004 Evaluatoren |
+
+Wenn du neue Findings-Regeln hinzufügst, ergänze hier eine passende Testdatei
+- siehe README.md Abschnitt "Extending this pipeline".
+
+---
+
+# Schritt 4: Einzelne Analysefunktionen isoliert testen (mit echten/Test-Daten)
+
+Bevor der komplette `run_analysis()`-Lauf gestartet wird, lohnt es sich, die
+Bausteine einzeln gegen eine echte (oder eine kleine Test-)Umgebung zu prüfen.
+
+```{r source-modules}
+source(file.path(project_root, "R/utils_logging.R"))
+source(file.path(project_root, "R/connection.R"))
+source(file.path(project_root, "R/data_users.R"))
+source(file.path(project_root, "R/data_roles_licensing.R"))
+source(file.path(project_root, "R/data_telemetry.R"))
+source(file.path(project_root, "R/analyze_roles.R"))
+source(file.path(project_root, "R/analyze_users_consolidated.R"))
+source(file.path(project_root, "R/confidence.R"))
+source(file.path(project_root, "R/findings_engine.R"))
+source(file.path(project_root, "R/reporting_excel.R"))
+source(file.path(project_root, "R/reporting_markdown.R"))
+
+cfg <- load_config(file.path(project_root, "config"))
+cnn <- get_readonly_connection("PRJ", cfg)
+```
+
+## 4.1 Benutzer laden und analysieren
+
+```{r step-users}
+users <- load_users(cnn, file.path(project_root, "sql"))
+invalid_users <- load_invalid_users(cnn, file.path(project_root, "sql"))
+app_users <- load_application_users(cnn, file.path(project_root, "sql"))
+
+user_profile <- analyze_users(users, invalid_users, app_users)
+head(user_profile)
+table(user_profile$user_status_flag)
+```
+
+## 4.2 Security-Struktur laden und prüfen
+
+```{r step-secgov}
+secgov <- load_security_governance_objects(cnn, file.path(project_root, "sql"))
+licensing_req <- load_licensing_requirements(cnn, file.path(project_root, "sql"))
+
+sec_structure <- analyze_security_structure(secgov, licensing_req)
+nrow(sec_structure)
+head(sec_structure)
+```
+
+**Kontrolle:** Falls `sec_structure$ENTITLED` komplett `"UNKNOWN"` ist, wurde
+die Rollen-Spalte nicht sauber erkannt - dann `names(secgov)` und
+`names(licensing_req$role)` mit den in `R/data_roles_licensing.R` erwarteten
+Spaltennamen (`ROLENAME`, `SECURITYROLE`, ...) abgleichen.
+
+```{r step-role-metrics}
+role_metrics <- analyze_role_metrics(sec_structure)
+role_metrics[order(-role_metrics$entry_point_count), ] |> head(10)
+```
+
+## 4.3 Telemetrie testen (mit kurzem Zeitraum)
+
+```{r step-telemetry}
+# telemetry_days kommt aus config.local.yml - zum Testen bewusst klein halten
+touches <- load_telemetry_touches(cfg, file.path(project_root, "kql"))
+attr(touches, "status")   # "OK", "OK_EMPTY" oder "UNKNOWN"
+head(touches)
+```
+
+## 4.4 Konsolidiertes Benutzerprofil bauen
+
+```{r step-consolidated}
+user_roles <- analyze_user_roles(sec_structure)
+attr(user_roles, "status")   # sollte "OK" sein, sonst siehe README §8 Punkt 3
+
+user_role_class <- classify_service_vs_business_roles(user_roles, cfg)
+table(user_role_class$role_combination_class)
+
+# Transaktionsaktivität ist standardmäßig nicht konfiguriert -> UNKNOWN, das ist korrekt:
+transaction_activity <- data.frame()
+attr(transaction_activity, "status") <- "UNKNOWN_NO_TABLE_CONFIGURED"
+
+user_profiles <- build_user_profiles(
+  user_profile, user_role_class, touches, transaction_activity, cfg
+)
+table(user_profiles$activity_evidence_status)
+```
+
+## 4.5 Findings testweise generieren
+
+```{r step-findings}
+rules_cfg <- yaml::read_yaml(file.path(project_root, cfg$findings$rules_file))$rules
+
+ctx <- list(
+  users = users, invalid_users_analysis = analyze_invalid_users(users, invalid_users),
+  app_users_analysis = analyze_application_users(app_users),
+  user_roles = user_roles, user_role_class = user_role_class,
+  sec_structure = sec_structure, role_metrics = role_metrics,
+  telemetry_touches = touches, user_profiles = user_profiles, cfg = cfg
+)
+
+findings <- generate_findings(ctx, rules_cfg)
+table(findings$finding_id)
+table(findings$severity, findings$confidence)
+```
+
+```{r inspect-findings}
+findings[findings$finding_id == "FINDING-001", ]
+```
+
+Verbindung am Ende dieses Testlaufs sauber schließen:
+
+```{r close-connection}
+DBI::dbDisconnect(cnn)
+```
+
+---
+
+# Schritt 5: Vollständigen, produktiven Lauf starten
+
+Sobald Schritt 3 (Tests) grün ist und Schritt 4 (Einzelbausteine) plausible
+Ergebnisse liefert, kann der komplette, reproduzierbare Lauf gestartet
+werden.
+
+## 5.1 Aus R/RStudio heraus
+
+```{r full-run-r}
+source(file.path(project_root, "R/run_analysis.R"))
+
+# get_connection() muss weiterhin geladen sein (siehe Schritt 2)
+result <- run_analysis(environment = "PRJ", root = project_root)
+
+# Ergebnisobjekt enthält alle Zwischenstände zur Inspektion:
+names(result)
+result$excel_path
+result$markdown_path
+nrow(result$findings)
+```
+
+## 5.2 Alternativ von der Kommandozeile
+
+```{bash full-run-cli}
+cd PFAD/ZU/d365-licensing-analysis
+Rscript R/run_analysis.R PRJ
+```
+
+## 5.3 Ergebnisse prüfen
+
+```{r inspect-outputs}
+list.files(file.path(project_root, "reports"))
+list.files(file.path(project_root, "reports", "logs"))
+```
+
+```{r open-markdown-report}
+writeLines(readLines(result$markdown_path))
+```
+
+```{r inspect-excel}
+readxl::excel_sheets(result$excel_path)
+readxl::read_excel(result$excel_path, sheet = "Findings") |> head(20)
+```
+
+---
+
+# Schritt 6: Typische Probleme & Checkliste
+
+```{r troubleshooting-table, eval=TRUE, echo=FALSE, results='asis'}
+cat("
+| Symptom | Wahrscheinliche Ursache | Was tun |
+|---|---|---|
+| `get_connection() was not found` | Connection-Datei nicht gesourced | Schritt 2 wiederholen, Pfad prüfen |
+| `BLOCKED: query contains a forbidden write/DDL statement` | Ein `.sql`-File wurde manuell verändert und enthält jetzt ein Schreibkeyword | Datei unter `sql/` prüfen, nur `SELECT` erlaubt |
+| `sec_structure$ENTITLED` überall `UNKNOWN` | Spaltennamen in `USERSECGOVRELATEDOBJECTS`/`*_DETAILEDVIEW` weichen von den erwarteten Standardnamen ab | `names(secgov)` / `names(licensing_req$role)` prüfen, ggf. `.normalize_licensing_columns()` in `R/data_roles_licensing.R` erweitern |
+| `attr(touches, 'status') == 'UNKNOWN'` | Env-Vars für App Insights fehlen oder `telemetry.enabled: false` | `config.local.yml` und `~/.Renviron` prüfen (Schritt 1.2) |
+| `analyze_user_roles()` liefert `UNKNOWN_NO_USER_ROLE_LINK` | Keine USERID-Spalte in `USERSECGOVRELATEDOBJECTS` gefunden | 'Security User Role Association' Data Entity als Alternativquelle anbinden (README §8 Punkt 3) |
+| Tests schlagen bei `test-security-structure.R` fehl | Reale Spaltennamen weichen von Testannahmen ab | Kein Bug in eurer DB - Testfixtures ggf. an eure tatsächliche View-Struktur anpassen |
+")
+```
+
+---
+
+# Zusammenfassung des empfohlenen Ablaufs
+
+1. Pakete installieren, `config.local.yml` anlegen (Schritt 1).
+2. `get_connection()` sourcen und einmal manuell testen (Schritt 2).
+3. `testthat`-Suite laufen lassen - muss grün sein, bevor es weitergeht (Schritt 3).
+4. Einzelne Analysebausteine gegen eine echte/Test-Umgebung mit kurzem
+   `telemetry_days` (z. B. 30-90 Tage) durchgehen und Zwischenergebnisse
+   stichprobenartig prüfen (Schritt 4).
+5. Erst danach den vollständigen `run_analysis()`-Lauf starten, idealerweise
+   zunächst mit einem kleineren `telemetry_days`-Wert, um Laufzeit und Report
+   schnell zu validieren, bevor produktiv mit z. B. 700 Tagen gearbeitet wird
+   (Schritt 5).
+6. Excel- und Markdown-Report sowie das Log unter `reports/` und
+   `reports/logs/` gegenprüfen (Schritt 5.3).
