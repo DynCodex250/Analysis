@@ -1,7 +1,8 @@
-SELECT S.RECID, S.NAME, S.AOTNAME
-FROM SECURITYROLE S
-WHERE S.RECID IN (99, 412, 418, 444, 496);   -- die RecIds aus deinem allerersten Screenshot
+-- 1. Die View-Definitionen (Rechtsklick auf View > Script View as > CREATE To > New Query Editor Window)
+--    für:
+LICENSINGDUTYREQUIREMENTSDETAILEDVIEW
+LICENSINGPRIVILEGEREQUIREMENTSDETAILEDVIEW
 
-licensing_req <- load_licensing_requirements(cnn, "sql")
-sec_structure <- analyze_security_structure(secgov, licensing_req)
-unique(sec_structure$ENTITLED)   # sollte jetzt 0/1-Werte zeigen, nicht mehr NA
+-- 2. Falls das zu viel Aufwand ist, reicht auch erstmal nur die Spaltenliste + ein paar Zeilen:
+SELECT TOP 5 * FROM LICENSINGDUTYREQUIREMENTSDETAILEDVIEW;
+SELECT TOP 5 * FROM LICENSINGPRIVILEGEREQUIREMENTSDETAILEDVIEW;
