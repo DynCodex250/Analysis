@@ -1,0 +1,13 @@
+# config.local.yml — lokale Überschreibungen
+# NICHT in Git committen! (steht in .gitignore)
+
+default:
+  connection:
+    credentials_path: "C:/Users/xxxx/Documents/RProjects/D365Security/db_credentials.xlsx"
+
+  telemetry:
+    enabled: false
+
+  paths:
+    reports_dir: "C:/Temp/d365_reports"
+    log_dir:     "C:/Temp/d365_logs"
