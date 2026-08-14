@@ -1,8 +1,4 @@
--- 1. Die View-Definitionen (Rechtsklick auf View > Script View as > CREATE To > New Query Editor Window)
---    für:
-LICENSINGDUTYREQUIREMENTSDETAILEDVIEW
-LICENSINGPRIVILEGEREQUIREMENTSDETAILEDVIEW
-
--- 2. Falls das zu viel Aufwand ist, reicht auch erstmal nur die Spaltenliste + ein paar Zeilen:
-SELECT TOP 5 * FROM LICENSINGDUTYREQUIREMENTSDETAILEDVIEW;
-SELECT TOP 5 * FROM LICENSINGPRIVILEGEREQUIREMENTSDETAILEDVIEW;
+duty_req <- run_readonly_query(cnn, "sql/07_licensing_duty_requirements.sql", params = list(EntitledOnly = TRUE))
+head(duty_req)
+priv_req <- run_readonly_query(cnn, "sql/08_licensing_privilege_requirements.sql", params = list(EntitledOnly = TRUE))
+head(priv_req)
