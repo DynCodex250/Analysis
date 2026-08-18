@@ -1,0 +1,318 @@
+# HowTo: WIBU-Rollenmapping, Rollenvergleich und XML-Modifikation (Kompakt)
+
+## Konzept
+
+```text
+Dev-Rolle   AOTNAME enthält WIBU → lesbarer Identifier
+Config-Rolle AOTNAME enthält kein WIBU, NAME enthält WIBU → GUID
+Join-Key    Dev-NAME ohne Klammer-Suffix = Config-NAME
+```
+
+---
+
+## Phase 1 – Rollenmapping
+
+```{r}
+library(D365Security)
+
+# Alle WIBU-Rollen (Dev + Config)
+alle_rollen <- load_all_wibu_roles(connection)
+
+# Nur Config-Rollen (GUID-AOTNAME)
+config_rollen <- load_config_roles(connection)
+
+# Nur Dev-Rollen (mit bereinigtem NAME2)
+dev_rollen <- load_dev_roles(connection)
+
+# Dev als Basis – Config optional (NA = kein Match)
+dev_mapping <- load_dev_role_mapping(connection)
+dplyr::filter(dev_mapping, is.na(CONFIDENT))   # Dev ohne Config-Entsprechung
+
+# Config als Basis – nur erfolgreiche Matches → Eingabe für Vergleich
+mapping <- load_role_mapping(connection)
+```
+
+---
+
+## Phase 2 – Rollenvergleich
+
+```{r}
+config_folder <- "C:/Pfad/ConfigRoles/AxSecurityRole"
+dev_folder    <- "C:/Pfad/DevRoles/AxSecurityRole"
+
+# Einzelvergleich (optional)
+vergleich <- compare_security_roles(
+  role_file_1 = file.path(config_folder, "39F3F3C7-....xml"),
+  role_file_2 = file.path(dev_folder,    "_WIBU_FIBU_FINANZBUCHHALTUNG.xml")
+)
+vergleich$duties$only_in_role_1   # Duties nur in Config
+vergleich$duties$only_in_role_2   # Duties nur in Dev
+
+# Batchvergleich aller Rollenpaare → Excel
+ergebnis <- compare_all_roles(
+  roleMapping  = mapping,
+  ConfigFolder = config_folder,
+  DevFolder    = dev_folder,
+  outputFile   = "RoleComparison.xlsx"
+)
+
+# Nur Unterschiede
+dplyr::filter(ergebnis, type != "common")
+```
+
+---
+
+## Excel-Ausgabe
+
+| Blatt | Inhalt |
+|---|---|
+| `RoleComparison` | Vollständiges Protokoll |
+| `RoleMapping` | Verwendetes Mapping |
+| `DifferencesOnly` | Nur Unterschiede und Fehler |
+
+---
+
+## Phase 3 – XML-Modifikation und Qualitätssicherung
+
+```{r}
+library(xml2)
+
+aot_dir    <- "K:/AosService/PackagesLocalDirectory/ApplicationSuite"
+output_dir <- "C:/Pfad/WIBU/Model"
+
+# --- Custom-Duty erzeugen ---
+duty_doc <- xml2::read_xml(file.path(aot_dir, "AxSecurityDuty/AxSecurityDuty_ProdProductionProcessEnable.xml"))
+
+xml2::xml_set_text(xml2::xml_find_first(duty_doc, "/AxSecurityDuty/Name"),  "_WIBUProdProductionProcessEnable")
+xml2::xml_set_text(xml2::xml_find_first(duty_doc, "/AxSecurityDuty/Label"), "_WIBU Produktionsprozess aktivieren")
+
+target <- xml2::xml_find_first(duty_doc, "//Privileges/AxSecurityPrivilegeReference[Name='ProdMultiUserDefaultProcess']")
+if (!is.null(target)) xml2::xml_remove(target)
+
+xml2::write_xml(duty_doc, file.path(output_dir, "AxSecurityDuty/AxSecurityDuty__WIBUProdProductionProcessEnable.xml"), options = "format")
+
+# --- Custom-Rolle erzeugen (Hilfsfunktion) ---
+modify_role <- function(standard_role_path, new_role_name, new_role_label,
+                        old_duty_name, new_duty_name, output_dir) {
+  doc <- xml2::read_xml(standard_role_path)
+  xml2::xml_set_text(xml2::xml_find_first(doc, "/AxSecurityRole/Name"),  new_role_name)
+  xml2::xml_set_text(xml2::xml_find_first(doc, "/AxSecurityRole/Label"), new_role_label)
+  duty_node <- xml2::xml_find_first(doc, sprintf("//Duties/AxSecurityDutyReference[Name='%s']/Name", old_duty_name))
+  if (!is.null(duty_node)) xml2::xml_set_text(duty_node, new_duty_name)
+  xml2::write_xml(doc, file.path(output_dir, paste0("AxSecurityRole_", new_role_name, ".xml")), options = "format")
+}
+
+modify_role(
+  standard_role_path = file.path(aot_dir, "AxSecurityRole/AxSecurityRole_ProdProductionManager.xml"),
+  new_role_name      = "_WIBUProdProductionManager",
+  new_role_label     = "_WIBU Produktion Produktionsleiter",
+  old_duty_name      = "ProdProductionProcessEnable",
+  new_duty_name      = "_WIBUProdProductionProcessEnable",
+  output_dir         = file.path(output_dir, "AxSecurityRole")
+)
+
+# --- Qualitätssicherung ---
+# Duty: Privilege entfernt?
+duty_check <- analyze_security_object(file.path(output_dir, "AxSecurityDuty/AxSecurityDuty__WIBUProdProductionProcessEnable.xml"))
+"ProdMultiUserDefaultProcess" %in% duty_check$privileges$Name   # → FALSE
+
+# Rolle: Nur Duty-Tausch, Rest identisch?
+vergleich <- compare_security_roles(
+  role_file_1 = file.path(aot_dir, "AxSecurityRole/AxSecurityRole_ProdProductionManager.xml"),
+  role_file_2 = file.path(output_dir, "AxSecurityRole/AxSecurityRole__WIBUProdProductionManager.xml")
+)
+vergleich$duties$only_in_role_1   # "ProdProductionProcessEnable"      (Standard)
+vergleich$duties$only_in_role_2   # "_WIBUProdProductionProcessEnable" (Custom)
+vergleich$privileges$only_in_role_1  # character(0) — kein Unterschied
+```
+
+---
+
+## Phase 4 – Security Customizer (automatisierter Graph-Engine)
+
+Vollautomatische Analyse einer vollständigen Rollenhierarchie für ein
+Ziel-Menüelement. Entscheidung per Knoten: `Keep` / `Replace` / `NoReplace`.
+Generiert WIBU-Custom-XMLs und einen technischen Audit-Report.
+
+```{r}
+# Einbinden (ohne automatischen Pipeline-Ablauf)
+security_customizer_autorun <- FALSE
+source("security_customizer.R")
+
+# Hierarchie aus DB laden
+con       <- get_connection("TST")
+hierarchy <- get_sql_security_hierarchy(con = con, resources = "ProdMultiUserDefault")
+DBI::dbDisconnect(con)
+
+# Engine instanziieren (AOT-Index + XML-Cache bleiben warm für mehrere Ziele)
+engine <- new_security_engine(
+  aot_root      = "C:/Users/CKAM/AppData/Local/Microsoft/Dynamics365/10.0.2645.90/PackagesLocalDirectory",
+  output_dir    = "C:/Users/CKAM/Documents/RProjects/WIBU_Security/",
+  custom_prefix = "_WIBU_"
+)
+
+# Analyse und XML-Generierung für ein Menüelement
+report <- engine$run(menu_item = "ProdMultiUserDefault", hierarchy = hierarchy)
+
+# Ergebnis
+report$generated_duties      # erzeugte Custom-Duties
+report$generated_roles       # erzeugte Custom-Rollen
+report$generated_xml_files   # alle erzeugten Dateien
+report$warnings              # Warnungen (fehlende AOT-Dateien etc.)
+
+# Knotenentscheidungen einsehen
+nodes       <- engine$get_nodes()
+engine$cache_stats()
+
+# Für mehrere Menüelemente (Cache bleibt warm)
+for (ziel in c("ProdMultiUserDefault", "CustPostInvoice")) {
+  hier <- get_sql_security_hierarchy(con = con, resources = ziel)
+  engine$run(menu_item = ziel, hierarchy = hier)
+}
+```
+
+**Entscheidungslogik:**
+
+| Entscheidung | Bedeutung |
+|---|---|
+| `Keep` | Kein Bezug zum Ziel-Menüelement → unverändert |
+| `NoReplace` | Gewährt ausschließlich Zugang zum Ziel → wird entfernt |
+| `Replace` | Gewährt auch anderen Zugang → WIBU-Kopie wird erzeugt |
+
+---
+
+## Phase 5a – Benutzerberechtigungsvergleich (Livedaten)
+
+Lädt Rollenzuweisungen direkt aus der DB und analysiert sie aus sechs Perspektiven.
+Ergebnis: Excel mit 6 Blättern.
+
+```{r}
+library(readxl); library(dplyr); library(openxlsx)
+devtools::load_all("C:/Users/CKAM/Documents/RProjects/D365Security")
+
+cnn <- get_connection("PRJ", "pfad/db_credentials.xlsx")
+
+# Daten laden
+e <- get_sql_user_role_assignments(cnn, user_ids = c("wibule01", "wibule02"))
+
+# Fingerprint-Spalten
+r <- c("USERID", "SECURITYROLENAME", "ORGANIZATIONID")
+
+# Analyse 1 – Fingerprint-Hash pro Benutzer
+fp  <- sec_compare_user_permissions_fingerprint(e, r)
+
+# Analyse 2 – Rollen-Matrix (Benutzer × Rollen)
+rm  <- sec_create_role_matrix(e)
+
+# Analyse 3 – Abweichungen vom Referenzbenutzer
+ref <- sec_compare_to_reference_user_details(e, reference_user = "wibule02")
+
+# Analyse 4 – Gruppen identischer Benutzer
+grp <- sec_create_permission_groups(fp)
+
+# Analyse 5 – Farbige Berechtigungsmatrix
+pm  <- sec_create_permission_matrix(e)
+
+# Analyse 6 – Paarweiser TRUE/FALSE-Vergleich
+uc  <- sec_compare_users_complete(e)
+
+# Excel-Export (6 Blätter)
+wb <- openxlsx::createWorkbook()
+openxlsx::addWorksheet(wb, "01_Fingerprint_Analyse");  openxlsx::writeDataTable(wb, "01_Fingerprint_Analyse",  fp)
+openxlsx::addWorksheet(wb, "02_RollenMatrix");         openxlsx::writeDataTable(wb, "02_RollenMatrix",         rm)
+openxlsx::addWorksheet(wb, "03_Referenzvergleich");    openxlsx::writeDataTable(wb, "03_Referenzvergleich",    ref)
+openxlsx::addWorksheet(wb, "04_Berechtigungsgruppen"); openxlsx::writeDataTable(wb, "04_Berechtigungsgruppen", grp)
+wb <- export_permission_matrix_sheet(wb, "05_permission_matrix", pm)
+openxlsx::addWorksheet(wb, "06_users_complete");       openxlsx::writeDataTable(wb, "06_users_complete",       uc)
+openxlsx::saveWorkbook(wb, "D365FO_Benutzerberechtigungsvergleich.xlsx", overwrite = TRUE)
+```
+
+---
+
+## Phase 5b – Benutzerberechtigungsvergleich (Mock-Daten)
+
+Identischer Workflow wie 5a — `e` wird durch einen Tibble ersetzt statt per DB geladen.
+Einsatz: Entwicklung, Tests, Demonstration ohne D365FO-Zugang.
+
+```{r}
+library(dplyr); library(openxlsx); library(tibble)
+devtools::load_all("C:/Users/CKAM/Documents/RProjects/D365Security")
+
+# Mock-Daten (ersetzt get_sql_user_role_assignments + DB-Verbindung)
+# Format identisch mit dem Rückgabewert der DB-Funktion
+e <- tibble::tibble(
+  USERID = c(
+    "s.o.","s.o.",
+    "s.t.","s.t.","s.t.",   # Referenzbenutzer: vollständiges Profil
+    "a.b.","a.b.","a.b.",   # identisch zu s.t.
+    "x.y.","x.y."           # abweichendes Profil
+  ),
+  SECURITYROLEIDENTIFIER = c(
+    "408D9823-E27F-417A-8888-111111111111","C3B0DBE5-FDAE-4925-B162-21A3E0D04E2A",
+    "408D9823-E27F-417A-8888-111111111111","C3B0DBE5-FDAE-4925-B162-21A3E0D04E2A","E99D8F11-417A-417A-8888-222222222222",
+    "408D9823-E27F-417A-8888-111111111111","C3B0DBE5-FDAE-4925-B162-21A3E0D04E2A","E99D8F11-417A-417A-8888-222222222222",
+    "C3B0DBE5-FDAE-4925-B162-21A3E0D04E2A","F88A2222-3333-4444-5555-666666666666"
+  ),
+  SECURITYROLENAME = c(
+    "_TEST Verkauf Innendienst Leitung","_TEST Einkauf Mitarbeiter_ReadOnly",
+    "_TEST Verkauf Innendienst Leitung","_TEST Einkauf Mitarbeiter_ReadOnly","_TEST Projektmanagement",
+    "_TEST Verkauf Innendienst Leitung","_TEST Einkauf Mitarbeiter_ReadOnly","_TEST Projektmanagement",
+    "_TEST Einkauf Mitarbeiter_ReadOnly","_TEST Systemadministrator"
+  ),
+  ORGANIZATIONID = c("All","All","All","All","All","All","All","All","All","DE10")
+)
+
+# Ab hier identisch zu Phase 5a
+r   <- c("USERID", "SECURITYROLENAME", "ORGANIZATIONID")
+fp  <- sec_compare_user_permissions_fingerprint(e, r)   # s.t. = a.b. → gleicher Hash
+rm  <- sec_create_role_matrix(e)
+ref <- sec_compare_to_reference_user_details(e, reference_user = "s.t.")
+grp <- sec_create_permission_groups(fp)
+pm  <- sec_create_permission_matrix(e)
+uc  <- sec_compare_users_complete(e)                    # s.t. vs a.b. → TRUE
+
+wb <- openxlsx::createWorkbook()
+openxlsx::addWorksheet(wb, "01_Fingerprint_Analyse");  openxlsx::writeDataTable(wb, "01_Fingerprint_Analyse",  fp)
+openxlsx::addWorksheet(wb, "02_RollenMatrix");         openxlsx::writeDataTable(wb, "02_RollenMatrix",         rm)
+openxlsx::addWorksheet(wb, "03_Referenzvergleich");    openxlsx::writeDataTable(wb, "03_Referenzvergleich",    ref)
+openxlsx::addWorksheet(wb, "04_Berechtigungsgruppen"); openxlsx::writeDataTable(wb, "04_Berechtigungsgruppen", grp)
+wb <- export_permission_matrix_sheet(wb, "05_permission_matrix", pm)
+openxlsx::addWorksheet(wb, "06_users_complete");       openxlsx::writeDataTable(wb, "06_users_complete",       uc)
+openxlsx::saveWorkbook(wb, "D365FO_Benutzerberechtigungsvergleich_Mock.xlsx", overwrite = TRUE)
+```
+
+**Unterschied zu 5a auf einen Blick:**
+
+| | 5a Livedaten | 5b Mock-Daten |
+|---|---|---|
+| Verbindung | `get_connection()` | entfällt |
+| Daten | `get_sql_user_role_assignments(cnn, ...)` | `tibble::tibble(...)` |
+| Analysen | identisch | identisch |
+| Excel-Export | identisch | identisch |
+
+---
+
+## Funktionsübersicht
+
+| Funktion | Zweck |
+|---|---|
+| `load_all_wibu_roles()` | Alle WIBU-Rollen (Dev + Config) |
+| `load_config_roles()` | Nur Config-Rollen |
+| `load_dev_roles()` | Nur Dev-Rollen (mit NAME2) |
+| `load_dev_role_mapping()` | Dev als Basis, Config optional |
+| `load_role_mapping()` | Nur Matches → Input für compare_all_roles |
+| `compare_security_roles()` | Einzelvergleich zweier XML-Rollen (`role_file_1`, `role_file_2`) |
+| `compare_all_roles()` | Batchvergleich + Excel-Export |
+| `analyze_security_object()` | Strukturanalyse einer XML-Datei (`$duties`, `$privileges`, `$entrypoints`) |
+| `new_security_engine()` | Graph-Engine instanziieren (AOT-Index aufbauen, Cache initialisieren) |
+| `engine$run()` | Analyse + Generierung für ein Menüelement |
+| `engine$get_nodes()` | Vollständiger Knotengraph mit Entscheidungen |
+| `engine$cache_stats()` | XML-Cache-Statistik |
+| `get_sql_user_role_assignments()` | Rollenzuweisungen aus DB laden |
+| `sec_compare_user_permissions_fingerprint()` | Fingerprint-Hash pro Benutzer |
+| `sec_create_role_matrix()` | Rollen × Benutzer Matrix |
+| `sec_compare_to_reference_user_details()` | Abweichungen vom Referenzbenutzer |
+| `sec_create_permission_groups()` | Gruppen identischer Benutzer |
+| `sec_create_permission_matrix()` | Farbige Berechtigungsmatrix |
+| `sec_compare_users_complete()` | Paarweiser TRUE/FALSE-Vergleich |
+| `export_permission_matrix_sheet()` | Matrix-Blatt mit Farbformatierung in Workbook einfügen |
