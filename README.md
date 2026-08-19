@@ -2,6 +2,6 @@ source("PFAD/ZU/EUREM/PROJEKT/appinsights_helpers.R")   # eure Datei mit get_app
 exists("run_appinsights_query", mode = "function")       # sollte TRUE sein
 
 source("R/data_telemetry.R")
-touches <- load_telemetry_touches(cfg, "kql", environment = "PRJ")
+touches <- load_telemetry_touches(cfg, "kql", environment = "TTT")
 attr(touches, "status")   # "OK", "OK_EMPTY" oder "UNKNOWN"
 head(touches)
