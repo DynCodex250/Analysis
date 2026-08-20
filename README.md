@@ -1,46 +1,56 @@
-SELECT
-  min_sku.SKUNAME,
-  min_sku.PRIORITY,
-  COUNT(*) AS privilege_count
-FROM (
-  SELECT
-    lprs.SECURITYPRIVILEGE,
-    MIN(lprs.PRIORITY) AS PRIORITY
-  FROM LICENSINGPRIVILEGESREQUIREMENTSSUMMARYVIEW lprs
-  WHERE lprs.ENTITLED = 1
-    AND lprs.SECURITYPRIVILEGE IN (
-      SELECT rpe.SECURITYPRIVILEGE
-      FROM SECURITYROLE sr
-      JOIN SECURITYROLEPRIVILEGEEXPLODEDGRAPH rpe
-        ON rpe.SECURITYROLE = sr.RECID
-      WHERE sr.AOTNAME = '32B63442-1415-459D-8FF0-399780947265'
-    )
-  GROUP BY lprs.SECURITYPRIVILEGE
-) min_prio
-JOIN LICENSINGPRIVILEGESREQUIREMENTSSUMMARYVIEW min_sku
-  ON  min_sku.SECURITYPRIVILEGE = min_prio.SECURITYPRIVILEGE
-  AND min_sku.PRIORITY          = min_prio.PRIORITY
-  AND min_sku.ENTITLED          = 1
-JOIN LICENSINGALLSKUS lask
-  ON lask.RECID = min_sku.SKURECID
-GROUP BY min_sku.SKUNAME, min_sku.PRIORITY
-ORDER BY min_sku.PRIORITY ASC
-SELECT
-  sp.IDENTIFIER          AS PRIVILEGEIDENTIFIER,
-  lask.SKUNAME,
-  lprs.PRIORITY,
-  lprs.ENTITLED,
-  lprs.NOTENTITLED
-FROM LICENSINGPRIVILEGESREQUIREMENTSSUMMARYVIEW lprs
-LEFT JOIN SECURITYPRIVILEGE sp   ON sp.RECID  = lprs.SECURITYPRIVILEGE
-LEFT JOIN LICENSINGALLSKUS  lask ON lask.RECID = lprs.SKURECID
-WHERE lprs.SECURITYPRIVILEGE IN (
-  SELECT DISTINCT sp2.RECID
-  FROM SECURITYROLE sr
-  JOIN SECURITYROLEPRIVILEGEEXPLODED rpe ON rpe.SECURITYROLE = sr.RECID
-  JOIN SECURITYPRIVILEGE sp2             ON sp2.RECID = rpe.SECURITYPRIVILEGE
-  WHERE sr.AOTNAME = 'xxxxxxxxxxxxxxxxxxxx'
-)
-AND lprs.ENTITLED = 1
-ORDER BY sp.IDENTIFIER, lprs.PRIORITY ASC
- 
+#' Lizenzen je Rolle kompakt (eine Zeile pro Rolle)
+#'
+#' Wrapper um \code{get_role_license_assignments()}, der alle SKUs
+#' einer Rolle in einer einzigen Zeile zusammenfasst (pipe-separiert).
+#'
+#' @param con
+#' Datenbankverbindung. Ergebnis von \code{get_connection()}.
+#'
+#' @param role_identifiers
+#' Optionaler Character-Vektor mit Rollen-AOTNAMEs.
+#' Wenn leer, werden alle Rollen zurückgegeben.
+#'
+#' @return
+#'
+#' Tibble mit einer Zeile pro Rolle.
+#'
+#' \describe{
+#'   \item{ROLEIDENTIFIER}{AOT-Name der Rolle.}
+#'   \item{SECURITYROLENAME}{Anzeigename der Rolle.}
+#'   \item{SKUNAME}{Alle Lizenz-SKUs, pipe-separiert (z.B. \code{"Finance | Commerce"}).}
+#'   \item{SKURECID}{Alle internen Lizenz-IDs, pipe-separiert.}
+#' }
+#'
+#' @examples
+#' \dontrun{
+#'
+#' cnn <- get_connection("PRJ", "db_credentials.xlsx")
+#'
+#' # Alle Rollen kompakt
+#' get_role_license_assignments_compact(cnn)
+#'
+#' # Nur bestimmte Rollen
+#' get_role_license_assignments_compact(
+#'   cnn,
+#'   role_identifiers = c("_WIBU_VERKAUF_KEYACCOUNT", "_WIBU_EINKAUF_MITARBEITER")
+#' )
+#'
+#' }
+#'
+#' @seealso
+#' \code{\link{get_role_license_assignments}}
+#'
+#' @export
+get_role_license_assignments_compact <- function(
+  con,
+  role_identifiers = character()
+) {
+  get_role_license_assignments(con, role_identifiers = role_identifiers) |>
+    dplyr::group_by(ROLEIDENTIFIER, SECURITYROLENAME) |>
+    dplyr::summarise(
+      SKUNAME  = paste(SKUNAME,  collapse = " | "),
+      SKURECID = paste(SKURECID, collapse = " | "),
+      .groups  = "drop"
+    ) |>
+    dplyr::arrange(ROLEIDENTIFIER)
+}
