@@ -1,7 +1,19 @@
-source("PFAD/ZU/EUREM/PROJEKT/appinsights_helpers.R")   # eure Datei mit get_appinsights_connection()/run_appinsights_query()
-exists("run_appinsights_query", mode = "function")       # sollte TRUE sein
-
-source("R/data_telemetry.R")
-touches <- load_telemetry_touches(cfg, "kql", environment = "TTT")
-attr(touches, "status")   # "OK", "OK_EMPTY" oder "UNKNOWN"
-head(touches)
+SELECT
+  sp.IDENTIFIER          AS PRIVILEGEIDENTIFIER,
+  lask.SKUNAME,
+  lprs.PRIORITY,
+  lprs.ENTITLED,
+  lprs.NOTENTITLED
+FROM LICENSINGPRIVILEGESREQUIREMENTSSUMMARYVIEW lprs
+LEFT JOIN SECURITYPRIVILEGE sp   ON sp.RECID  = lprs.SECURITYPRIVILEGE
+LEFT JOIN LICENSINGALLSKUS  lask ON lask.RECID = lprs.SKURECID
+WHERE lprs.SECURITYPRIVILEGE IN (
+  SELECT DISTINCT sp2.RECID
+  FROM SECURITYROLE sr
+  JOIN SECURITYROLEPRIVILEGEEXPLODED rpe ON rpe.SECURITYROLE = sr.RECID
+  JOIN SECURITYPRIVILEGE sp2             ON sp2.RECID = rpe.SECURITYPRIVILEGE
+  WHERE sr.AOTNAME = 'xxxxxxxxxxxxxxxxxxxx'
+)
+AND lprs.ENTITLED = 1
+ORDER BY sp.IDENTIFIER, lprs.PRIORITY ASC
+ 
