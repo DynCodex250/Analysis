@@ -22,7 +22,9 @@ mapping_file <- "C:/Users/ckam_admin/Documents/RProjects/D365_Admin/Data/FINAL_D
 mapping_sheet <- "Comparison"
 
 # Pfad zum RData-Objekt (wird erzeugt / geladen)
-rdata_path <- "C:/Users/ckam_admin/Documents/RProjects/D365_Admin/Data/EntityMenuItemAssociation.RData"
+rdata_path        <- "C:/Users/ckam_admin/Documents/RProjects/D365_Admin/Data/MD3-1625 S+ Parameter/Data/EntityMenuItemAssociation.RData"
+rdata_path_AOT    <- "C:/Users/ckam_admin/Documents/RProjects/D365_Admin/Data/MD3-1625 S+ Parameter/Data/EntityMenuItemAssociationFromAOT.RData"
+rdata_path_merged <- "C:/Users/ckam_admin/Documents/RProjects/D365_Admin/Data/MD3-1625 S+ Parameter/Data/mergedEntityMenuItem.RData"
 
 # Pfad zum lokalen D365FO-AOT-Verzeichnis (für get_entity_aot_metadata)
 aot_root <- "C:/Users/CKAM/AppData/Local/Microsoft/Dynamics365/10.0.2645.90/PackagesLocalDirectory"
@@ -41,21 +43,23 @@ base_url <- "https://wibu-pri.sandbox.operations.eu.dynamics.com"
 
 # Ausgabedatei
 output_file <- paste0(
-  "C:/Users/ckam_admin/Documents/RProjects/D365_Admin/Data/Entity_Comparison_",
+  "C:/Users/ckam_admin/Documents/RProjects/D365_Admin/Data/MD3-1625 S+ Parameter/Data/Entity_Comparison_",
   format(Sys.Date(), "%Y%m%d"), ".xlsx"
 )
 
 # =============================================================================
-# SCHRITT 1: Mapping aus Excel laden und als RData speichern
+# SCHRITT 1: Mapping aufbauen (Manuell + AOT-Anreicherung + Merge)
 # =============================================================================
 # Ausführen wenn:
-#   a) EntityMenuItemAssociation.RData noch nicht existiert, ODER
-#   b) die Quelldatei manuell aktualisiert wurde
+#   a) mergedEntityMenuItem.RData noch nicht existiert, ODER
+#   b) die Quelldateien manuell aktualisiert wurden
+# Bei erneutem Lauf: mergedEntityMenuItem direkt aus RData laden (<1 Sek.)
 
-create_rdata <- !file.exists(rdata_path)
+create_rdata <- !file.exists(rdata_path_merged)
 
 if (create_rdata) {
 
+  # --- 1a: Manuelles Mapping aus Excel laden ---
   raw <- readxl::read_excel(mapping_file, sheet = mapping_sheet)
 
   # Spaltennamen aus den Screenshots: A=TARGETENTITY, G=Module, I=MenuItem
@@ -76,66 +80,61 @@ if (create_rdata) {
       TARGETENTITY = tolower(trimws(as.character(TARGETENTITY))),
       Module       = trimws(as.character(Module)),
       MenuItem     = trimws(as.character(MenuItem)),
-      # NA normalisieren
       Module   = ifelse(Module   %in% c("NA", ""), NA_character_, Module),
       MenuItem = ifelse(MenuItem %in% c("NA", ""), NA_character_, MenuItem)
     ) |>
-    # Pro Entity den ersten vollständigen Eintrag nehmen
-    # (zuerst solche mit MenuItem bevorzugen)
     arrange(TARGETENTITY, is.na(MenuItem), is.na(Module)) |>
     group_by(TARGETENTITY) |>
     slice(1) |>
     ungroup()
 
   save(entity_menu_mapping, file = rdata_path)
-
   message(sprintf(
     "EntityMenuItemAssociation.RData erstellt: %d Entities, davon %d mit MenuItem",
     nrow(entity_menu_mapping),
     sum(!is.na(entity_menu_mapping$MenuItem))
   ))
 
+  # --- 1b: AOT-Metadaten laden und als RData speichern ---
+  # get_entity_aot_metadata() liest alle AxDataEntity-XML per Regex
+  EntityMenuItemAssociationFromAOT <- D365Security::get_entity_aot_metadata(aot_root) |>
+    dplyr::mutate(
+      Name    = tolower(trimws(as.character(Name))),
+      Modules = trimws(as.character(Modules)),
+      FormRef = trimws(as.character(FormRef)),
+      Modules = ifelse(Modules %in% c("NA", ""), NA_character_, Modules),
+      FormRef = ifelse(FormRef %in% c("NA", ""), NA_character_, FormRef)
+    )
+
+  save(EntityMenuItemAssociationFromAOT, file = rdata_path_AOT)
+
+  # --- 1c: Merge — Lücken in Module/MenuItem durch AOT-Werte füllen ---
+  mergedEntityMenuItem <- entity_menu_mapping |>
+    dplyr::left_join(
+      EntityMenuItemAssociationFromAOT,
+      by = c("TARGETENTITY" = "Name"),
+      keep = TRUE
+    ) |>
+    dplyr::mutate(
+      Module   = ifelse(is.na(Module),   Modules, Module),
+      MenuItem = ifelse(is.na(MenuItem), FormRef, MenuItem)
+    ) |>
+    dplyr::select(TARGETENTITY, Module, MenuItem)
+
+  save(mergedEntityMenuItem, file = rdata_path_merged)
+  message(sprintf(
+    "mergedEntityMenuItem erstellt: %d Entities | mit Module: %d | mit MenuItem: %d",
+    nrow(mergedEntityMenuItem),
+    sum(!is.na(mergedEntityMenuItem$Module)),
+    sum(!is.na(mergedEntityMenuItem$MenuItem))
+  ))
+
 } else {
 
-  load(rdata_path)  # lädt entity_menu_mapping
-  message(sprintf("EntityMenuItemAssociation.RData geladen: %d Entities", nrow(entity_menu_mapping)))
+  load(rdata_path_merged)  # lädt mergedEntityMenuItem
+  message(sprintf("mergedEntityMenuItem.RData geladen: %d Entities", nrow(mergedEntityMenuItem)))
 
 }
-
-# =============================================================================
-# SCHRITT 1b: AOT-Metadaten laden und Mapping anreichern
-# =============================================================================
-# get_entity_aot_metadata() liest alle AxDataEntity-XML-Dateien per Regex
-# und liefert Name, Modules, FormRef. Fehlende Module/MenuItem im manuellen
-# Mapping werden damit befüllt. Ergebnis: mergedEntityMenuItem.
-
-EntityMenuItemAssociationFromAOT <- D365Security::get_entity_aot_metadata(aot_root) |>
-  dplyr::mutate(
-    Name    = tolower(trimws(as.character(Name))),
-    Modules = trimws(as.character(Modules)),
-    FormRef = trimws(as.character(FormRef)),
-    Modules = ifelse(Modules %in% c("NA", ""), NA_character_, Modules),
-    FormRef = ifelse(FormRef %in% c("NA", ""), NA_character_, FormRef)
-  )
-
-mergedEntityMenuItem <- entity_menu_mapping |>
-  dplyr::left_join(
-    EntityMenuItemAssociationFromAOT,
-    by = c("TARGETENTITY" = "Name"),
-    keep = TRUE
-  ) |>
-  dplyr::mutate(
-    Module   = ifelse(is.na(Module),   Modules, Module),
-    MenuItem = ifelse(is.na(MenuItem), FormRef, MenuItem)
-  ) |>
-  dplyr::select(TARGETENTITY, Module, MenuItem)
-
-message(sprintf(
-  "Mapping nach AOT-Anreicherung: %d Entities | mit Module: %d | mit MenuItem: %d",
-  nrow(mergedEntityMenuItem),
-  sum(!is.na(mergedEntityMenuItem$Module)),
-  sum(!is.na(mergedEntityMenuItem$MenuItem))
-))
 
 # =============================================================================
 # SCHRITT 2: EntityMonitoringResults aus SQL laden
