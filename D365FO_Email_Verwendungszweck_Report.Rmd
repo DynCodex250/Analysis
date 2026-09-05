@@ -24,6 +24,7 @@ cnn <- D365Security::get_connection("TST", cred_path)
 library(dplyr)
 library(knitr)
 library(ggplot2)
+library(openxlsx)
 ```
 
 ---
@@ -59,6 +60,7 @@ WHERE d.TYPE    = 2
 GROUP BY c.DATAAREAID
 ORDER BY c.DATAAREAID;
 ```
+
 
 ```{sql connection=cnn, output.var="df_kritikalitaet"}
 SELECT
@@ -210,16 +212,46 @@ df_kritikalitaet |>
   knitr::kable(caption = "Anzahl Kunden je Schweregrad und Gesellschaft")
 ```
 
-### KRITISCH — vollständige Liste
+### KRITISCH — Übersicht (Top 2 je Gesellschaft)
 
 Kunden ohne **jeglichen** korrekten Purpose: sie erhalten garantiert keine Rechnung per E-Mail.
+Die vollständige Liste wird als Excel-Datei exportiert (siehe Hinweis unten).
 
-```{r kritisch-liste}
+```{r kritisch-export, include=FALSE}
+df_kritisch_komplett <- df_kritikalitaet |>
+  filter(Kritikalitaet == "KRITISCH") |>
+  select(CUSTOMERACCOUNT, DATAAREAID, Email_Falsch) |>
+  arrange(DATAAREAID, CUSTOMERACCOUNT)
+
+export_path <- paste0(
+  dirname(normalizePath(knitr::current_input())),
+  "/KRITISCH_Kunden_", format(Sys.Date(), "%Y%m%d"), ".xlsx"
+)
+
+openxlsx::write.xlsx(
+  df_kritisch_komplett,
+  file      = export_path,
+  sheetName = "KRITISCH",
+  overwrite = TRUE
+)
+```
+
+```{r kritisch-preview}
 df_kritikalitaet |>
   filter(Kritikalitaet == "KRITISCH") |>
   select(CUSTOMERACCOUNT, DATAAREAID, Email_Falsch) |>
   arrange(DATAAREAID, CUSTOMERACCOUNT) |>
-  knitr::kable(col.names = c("Kundennummer", "Gesellschaft", "E-Mail-Adresse"))
+  group_by(DATAAREAID) |>
+  slice_head(n = 2) |>
+  ungroup() |>
+  knitr::kable(
+    col.names = c("Kundennummer", "Gesellschaft", "E-Mail-Adresse"),
+    caption   = paste0(
+      "Vorschau: 2 Einträge je Gesellschaft — ",
+      n_kritisch, " Kunden gesamt. ",
+      "Vollständige Liste: KRITISCH_Kunden_", format(Sys.Date(), "%Y%m%d"), ".xlsx"
+    )
+  )
 ```
 
 ---
