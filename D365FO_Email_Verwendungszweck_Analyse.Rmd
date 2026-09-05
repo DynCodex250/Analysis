@@ -1,0 +1,728 @@
+﻿---
+output:
+  word_document: default
+  html_document: default
+---
+# D365FO – Prüfung der Verwendungszwecke von Rechnungs-E-Mail-Adressen
+
+**Autor:** Cedric Kameni  
+**Bereich:** D365 Systemadministration  
+**Hintergrund:** Analyse nach Supportfall — Kunde erhielt keine Rechnung per E-Mail trotz vorhandener E-Mail-Adresse
+
+---
+
+## Hintergrund
+
+Im Rahmen eines Supportfalls wurde festgestellt, dass ein Kunde seine Rechnung nicht per E-Mail erhalten hat. Die Untersuchung ergab:
+
+- Die E-Mail-Adresse war vorhanden
+- Der hinterlegte **Verwendungszweck** (`PURPOSE`) lautete `eInvoice`
+- Die Druckverwaltung der Gesellschaft 0900 sucht jedoch nach `eInvoice_0900`
+- Resultat: E-Mail-Adresse wird beim Versand **nicht gefunden** → keine Rechnung versandt
+
+### Warum ist der Verwendungszweck entscheidend?
+
+Die Druckverwaltung (`Print Management`) in D365 sucht beim Rechnungsversand per E-Mail gezielt nach einem Kontakteintrag mit dem **exakten, gesellschaftsspezifischen Verwendungszweck** (z.B. `eInvoice_0900`).
+
+### Korrekte Architektur (Cross-Company Data Sharing)
+
+Ein Kunde, der bei mehreren Gesellschaften bestellt, erhält mehrere E-Mail-Einträge:
+
+| Verwendungszweck | Bedeutung |
+|-----------------|-----------|
+| `eInvoice_0900` | Druckverwaltung 0900 findet diese Adresse → Rechnung wird versandt |
+| `eInvoice_0800` | Druckverwaltung 0800 findet diese Adresse → Rechnung wird versandt |
+| `eInvoice` | **Keiner** findet diese Adresse → Rechnung wird **nie** versandt |
+
+Diese Einträge werden via Cross-Company Data Sharing in alle Mandanten repliziert. Ein `eInvoice_0800`-Eintrag im Mandanten 0900 ist daher **korrekt und gewollt**.
+
+---
+
+## Relevante Tabellen
+
+| Tabelle | Inhalt | Schlüsselfelder |
+|---------|--------|----------------|
+| `DIRPARTYCONTACTENTITY` | E-Mail-Adressen und Kontaktdaten je Party | `PARTYNUMBER`, `TYPE`, `PURPOSE`, `LOCATOR` |
+| `CUSTCUSTOMERENTITY` | Kundenstamm je Gesellschaft | `CUSTOMERACCOUNT`, `PARTYNUMBER`, `DATAAREAID` |
+| `CUSTTABLE` | Kundenstammdaten inkl. Kundengruppe | `ACCOUNTNUM`, `DATAAREAID`, `CUSTGROUP` |
+
+**Filterbedingungen:**
+- `TYPE = 2` → E-Mail-Adresse (nicht Telefon, Fax etc.)
+- `DESCRIPTION LIKE '%Rechnung%'` → Rechnungs-E-Mail-Einträge
+- `CUSTGROUP NOT LIKE '%IC'` → Intercompany-Kunden ausschließen (siehe Abgrenzung unten)
+
+---
+
+## Abgrenzung: Intercompany-Kunden
+
+Intercompany-Kunden sind konzerninterne Verrechnungspartner. Sie nehmen **nicht** am externen Rechnungs-E-Mail-Versand über die Druckverwaltung teil — der IC-Prozess läuft über eigene Buchungslogik.
+
+**Erkennungsmerkmal:** `CUSTTABLE.CUSTGROUP` endet mit dem Suffix `IC` (z.B. `DE_IC`, `AT_IC`, `CH_IC`).
+
+**Konsequenz für dieses Dokument:** IC-Kunden werden aus **allen** nachfolgenden Analysen und SQL-Abfragen ausgeschlossen. Ein fehlender oder falscher `eInvoice_XXXX`-Purpose bei IC-Kunden ist kein Fehler und erfordert keine Korrekturmaßnahme.
+
+---
+
+> ⚠️ **ENTSCHEIDUNGSPUNKT — Bestätigung durch Stakeholder ausstehend**
+>
+> **Frage:** Sollen Intercompany-Kunden (`CUSTGROUP LIKE '%IC'`) dauerhaft und vollständig aus der Rechnungs-E-Mail-Analyse ausgeschlossen werden?
+>
+> **Annahme in diesem Dokument:** **JA** — IC-Kunden sind vom externen E-Mail-Rechnungsversand ausgenommen und benötigen keinen `eInvoice_XXXX`-Purpose.
+>
+> | | |
+> |-|-|
+> | **Entschieden von:** | ___________________________ |
+> | **Datum:** | ___________________________ |
+> | **Status:** | ☐ offen &emsp; ☐ bestätigt &emsp; ☐ abgelehnt |
+>
+> *Solange diese Entscheidung nicht formal bestätigt ist, wird die Annahme in allen Abfragen als Arbeitsgrundlage verwendet. Bei Ablehnung müssen alle SQL-Abfragen in diesem Dokument überarbeitet werden.*
+
+---
+
+## Schritt 1 – Alle Kunden mit generischem `eInvoice`-Verwendungszweck
+
+Diese Abfrage findet alle E-Mail-Einträge, bei denen der Verwendungszweck **exakt** `eInvoice` lautet — ohne Gesellschaftssuffix.
+
+```{sql connection=cnn}
+SELECT
+    c.CUSTOMERACCOUNT,
+    c.DATAAREAID,
+    ct.CUSTGROUP,
+    d.DESCRIPTION,
+    d.PURPOSE,
+    d.LOCATOR               AS EmailAdresse,
+    d.ISPRIMARY,
+    d.MODIFIEDBY,
+    d.MODIFIEDDATETIME
+FROM DIRPARTYCONTACTENTITY  d
+    INNER JOIN CUSTCUSTOMERENTITY c
+        ON  d.PARTYNUMBER  = c.PARTYNUMBER
+    INNER JOIN CUSTTABLE ct             -- IC-Filter
+        ON  ct.ACCOUNTNUM  = c.CUSTOMERACCOUNT
+        AND ct.DATAAREAID  = c.DATAAREAID
+WHERE d.TYPE    = 2
+  AND d.PURPOSE = 'eInvoice'
+  AND ct.CUSTGROUP NOT LIKE '%IC'       -- Intercompany-Kunden ausgeschlossen
+ORDER BY
+    c.DATAAREAID,
+    c.CUSTOMERACCOUNT;
+```
+
+---
+
+## Schritt 2 – Zusammenfassung: Wie viele betroffene Kunden je Gesellschaft?
+
+```{sql connection=cnn}
+SELECT
+    c.DATAAREAID,
+    COUNT(DISTINCT c.CUSTOMERACCOUNT)   AS Betroffene_Kunden,
+    COUNT(*)                            AS Betroffene_Eintraege
+FROM DIRPARTYCONTACTENTITY  d
+    INNER JOIN CUSTCUSTOMERENTITY c
+        ON  d.PARTYNUMBER  = c.PARTYNUMBER
+    INNER JOIN CUSTTABLE ct
+        ON  ct.ACCOUNTNUM  = c.CUSTOMERACCOUNT
+        AND ct.DATAAREAID  = c.DATAAREAID
+WHERE d.TYPE    = 2
+  AND d.PURPOSE = 'eInvoice'
+  AND ct.CUSTGROUP NOT LIKE '%IC'
+GROUP BY
+    c.DATAAREAID
+ORDER BY
+    c.DATAAREAID;
+```
+
+---
+
+## Schritt 3 – Kritikalität: Hat der Kunde daneben auch einen korrekten Verwendungszweck?
+
+Dies ist die wichtigste Abfrage. Sie unterscheidet zwischen zwei Szenarien:
+
+| Szenario | `Korrekter_Purpose` | Bedeutung |
+|----------|--------------------|-----------| 
+| **Kritisch** | `NULL` | Kunde hat **nur** `eInvoice` — erhält garantiert keine Rechnung per E-Mail |
+| **Bereinigen** | `eInvoice_XXXX` | Kunde hat **beide** — der korrekte Purpose existiert, `eInvoice` ist ein Überbleibsel |
+
+```{sql connection=cnn}
+SELECT
+    c.CUSTOMERACCOUNT,
+    c.DATAAREAID,
+
+    -- Falscher Eintrag
+    d_falsch.PURPOSE            AS Falscher_Purpose,
+    d_falsch.LOCATOR            AS Email_Falsch,
+
+    -- Korrekter Eintrag (falls vorhanden)
+    d_korrekt.PURPOSE           AS Korrekter_Purpose,
+    d_korrekt.LOCATOR           AS Email_Korrekt,
+
+    -- Kritikalität
+    CASE
+        WHEN d_korrekt.PURPOSE IS NULL
+            THEN 'KRITISCH – kein korrekter Purpose vorhanden'
+        ELSE
+            'Bereinigen – korrekter Purpose existiert parallel'
+    END                         AS Kritikalitaet
+
+FROM CUSTCUSTOMERENTITY c
+
+    INNER JOIN CUSTTABLE ct
+        ON  ct.ACCOUNTNUM  = c.CUSTOMERACCOUNT
+        AND ct.DATAAREAID  = c.DATAAREAID
+
+    -- Falscher Eintrag (genau 'eInvoice')
+    INNER JOIN DIRPARTYCONTACTENTITY d_falsch
+        ON  d_falsch.PARTYNUMBER = c.PARTYNUMBER
+        AND d_falsch.TYPE        = 2
+        AND d_falsch.PURPOSE     = 'eInvoice'
+
+    -- Korrekter gesellschaftsspezifischer Eintrag (falls vorhanden)
+    LEFT JOIN DIRPARTYCONTACTENTITY d_korrekt
+        ON  d_korrekt.PARTYNUMBER = c.PARTYNUMBER
+        AND d_korrekt.TYPE        = 2
+        AND d_korrekt.PURPOSE     = CONCAT('eInvoice_', c.DATAAREAID)
+
+WHERE ct.CUSTGROUP NOT LIKE '%IC'       -- Intercompany-Kunden ausgeschlossen
+
+ORDER BY
+    Kritikalitaet DESC,
+    c.DATAAREAID,
+    c.CUSTOMERACCOUNT;
+```
+
+---
+
+## Erwartetes Ergebnis
+
+| CUSTOMERACCOUNT | DATAAREAID | Falscher_Purpose | Korrekter_Purpose | Kritikalität |
+|----------------|-----------|-----------------|------------------|--------------|
+| 10100068 | 0900 | eInvoice | NULL | **KRITISCH** |
+| 10100002 | 0900 | eInvoice | eInvoice_0900 | Bereinigen |
+| 10100012 | 0800 | eInvoice | eInvoice_0800 | Bereinigen |
+
+---
+
+## Schritt 4 – Lückenanalyse: Kunden mit Rechnungen aber ohne `eInvoice_XXXX`
+
+Diese Analyse findet Kunden, die in einer Gesellschaft **aktiv Rechnungen erhalten haben**, aber **keinen** gesellschaftsspezifischen `eInvoice_XXXX`-Eintrag besitzen. Diese Kunden werden nicht gefunden — weder die richtige noch eine fehlerhafte Variante existiert.
+
+> **Unterschied zu Schritt 1–3:** Schritt 1–3 analysiert Kunden mit einem **falsch benannten** Purpose (`eInvoice` ohne Suffix). Schritt 4 findet Kunden, bei denen **gar kein** Rechnungs-Purpose hinterlegt ist.
+
+### Intercompany-Kunden gesondert behandeln
+
+Intercompany-Kunden (konzerninterne Verrechnungen) erhalten **keine** Rechnung per E-Mail über die Druckverwaltung — der Versand läuft über eigene IC-Prozesse. Ein fehlender `eInvoice_XXXX`-Eintrag ist bei diesen Kunden daher **kein Fehler**.
+
+Erkennungsmerkmal: `CUSTTABLE.CUSTGROUP` endet mit dem Suffix `IC` (z.B. `DE_IC`, `AT_IC`).
+
+| Abfrage | Inhalt |
+|---------|--------|
+| **Schritt 4a** | Reguläre Kunden ohne Purpose — handlungsrelevant |
+| **Schritt 4b** | Reguläre Kunden aktiv (letzte 12 Monate) — operative Priorisierung |
+| **Schritt 4c** | IC-Kunden ohne Purpose — zur Information, kein Handlungsbedarf |
+
+---
+
+### Schritt 4a – Reguläre Kunden: Rechnungen vorhanden, kein `eInvoice_XXXX`
+
+IC-Kunden (`CUSTGROUP LIKE '%IC'`) werden ausgeschlossen.
+
+```{sql connection=cnn}
+SELECT
+    inv.ORDERACCOUNT                    AS CUSTOMERACCOUNT,
+    inv.DATAAREAID,
+    ct.CUSTGROUP,
+    COUNT(DISTINCT inv.INVOICEID)       AS Anzahl_Rechnungen,
+    MAX(inv.INVOICEDATE)                AS Letzte_Rechnungsdatum,
+    MIN(inv.INVOICEDATE)                AS Erste_Rechnungsdatum
+
+FROM CUSTINVOICEJOUR inv
+
+    INNER JOIN CUSTTABLE ct
+        ON  ct.ACCOUNTNUM  = inv.ORDERACCOUNT
+        AND ct.DATAAREAID  = inv.DATAAREAID
+
+    -- Kundenstamm → Verbindung zu Kontaktdaten
+    INNER JOIN CUSTCUSTOMERENTITY c
+        ON  c.CUSTOMERACCOUNT = inv.ORDERACCOUNT
+        AND c.DATAAREAID      = inv.DATAAREAID
+
+    -- Suche nach gesellschaftsspezifischem E-Mail-Purpose (soll NICHT existieren)
+    LEFT JOIN DIRPARTYCONTACTENTITY d_email
+        ON  d_email.PARTYNUMBER = c.PARTYNUMBER
+        AND d_email.TYPE        = 2
+        AND d_email.PURPOSE     = CONCAT('eInvoice_', inv.DATAAREAID)
+
+WHERE ct.CUSTGROUP NOT LIKE '%IC'       -- Intercompany-Kunden ausschließen
+
+GROUP BY
+    inv.ORDERACCOUNT,
+    inv.DATAAREAID,
+    ct.CUSTGROUP
+
+HAVING MAX(d_email.PURPOSE) IS NULL     -- kein passender Purpose gefunden
+
+ORDER BY
+    inv.DATAAREAID,
+    inv.ORDERACCOUNT;
+```
+
+---
+
+### Schritt 4b – Fokus: Reguläre Kunden aktiv in den letzten 12 Monaten
+
+```{sql connection=cnn}
+SELECT
+    inv.ORDERACCOUNT                    AS CUSTOMERACCOUNT,
+    inv.DATAAREAID,
+    ct.CUSTGROUP,
+    COUNT(DISTINCT inv.INVOICEID)       AS Anzahl_Rechnungen_12M,
+    MAX(inv.INVOICEDATE)                AS Letzte_Rechnungsdatum
+
+FROM CUSTINVOICEJOUR inv
+
+    INNER JOIN CUSTTABLE ct
+        ON  ct.ACCOUNTNUM  = inv.ORDERACCOUNT
+        AND ct.DATAAREAID  = inv.DATAAREAID
+
+    INNER JOIN CUSTCUSTOMERENTITY c
+        ON  c.CUSTOMERACCOUNT = inv.ORDERACCOUNT
+        AND c.DATAAREAID      = inv.DATAAREAID
+
+    LEFT JOIN DIRPARTYCONTACTENTITY d_email
+        ON  d_email.PARTYNUMBER = c.PARTYNUMBER
+        AND d_email.TYPE        = 2
+        AND d_email.PURPOSE     = CONCAT('eInvoice_', inv.DATAAREAID)
+
+WHERE ct.CUSTGROUP NOT LIKE '%IC'
+  AND inv.INVOICEDATE >= DATEADD(MONTH, -12, GETDATE())
+
+GROUP BY
+    inv.ORDERACCOUNT,
+    inv.DATAAREAID,
+    ct.CUSTGROUP
+
+HAVING MAX(d_email.PURPOSE) IS NULL
+
+ORDER BY
+    Anzahl_Rechnungen_12M DESC,
+    inv.DATAAREAID,
+    inv.ORDERACCOUNT;
+```
+
+---
+
+### Schritt 4c – IC-Kunden: Lücken zur Information (kein Handlungsbedarf)
+
+Diese Abfrage zeigt Intercompany-Kunden ohne `eInvoice_XXXX`-Purpose. Der fehlende Eintrag ist bei IC-Kunden **bewusst und korrekt** — die Abfrage dient nur zur Transparenz und Dokumentation.
+
+```{sql connection=cnn}
+SELECT
+    inv.ORDERACCOUNT                    AS CUSTOMERACCOUNT,
+    inv.DATAAREAID,
+    ct.CUSTGROUP,
+    COUNT(DISTINCT inv.INVOICEID)       AS Anzahl_Rechnungen,
+    MAX(inv.INVOICEDATE)                AS Letzte_Rechnungsdatum
+
+FROM CUSTINVOICEJOUR inv
+
+    INNER JOIN CUSTTABLE ct
+        ON  ct.ACCOUNTNUM  = inv.ORDERACCOUNT
+        AND ct.DATAAREAID  = inv.DATAAREAID
+
+    INNER JOIN CUSTCUSTOMERENTITY c
+        ON  c.CUSTOMERACCOUNT = inv.ORDERACCOUNT
+        AND c.DATAAREAID      = inv.DATAAREAID
+
+    LEFT JOIN DIRPARTYCONTACTENTITY d_email
+        ON  d_email.PARTYNUMBER = c.PARTYNUMBER
+        AND d_email.TYPE        = 2
+        AND d_email.PURPOSE     = CONCAT('eInvoice_', inv.DATAAREAID)
+
+WHERE ct.CUSTGROUP LIKE '%IC'           -- nur Intercompany-Kunden
+
+GROUP BY
+    inv.ORDERACCOUNT,
+    inv.DATAAREAID,
+    ct.CUSTGROUP
+
+HAVING MAX(d_email.PURPOSE) IS NULL
+
+ORDER BY
+    ct.CUSTGROUP,
+    inv.DATAAREAID,
+    inv.ORDERACCOUNT;
+```
+
+---
+
+### Erwartetes Ergebnis (Lückenanalyse)
+
+**Schritt 4a/4b — Reguläre Kunden (Handlungsbedarf):**
+
+| CUSTOMERACCOUNT | DATAAREAID | CUSTGROUP | Anzahl_Rechnungen | Letzte_Rechnungsdatum |
+|----------------|-----------|----------|------------------|-----------------------|
+| 10100055 | 0900 | DE_STD | 24 | 2025-08-15 |
+| 10100088 | 0800 | AT_STD | 7 | 2025-06-30 |
+
+**Schritt 4c — IC-Kunden (nur zur Information):**
+
+| CUSTOMERACCOUNT | DATAAREAID | CUSTGROUP | Anzahl_Rechnungen | Letzte_Rechnungsdatum |
+|----------------|-----------|----------|------------------|-----------------------|
+| IC100001 | 0900 | DE_IC | 120 | 2025-09-01 |
+| IC100002 | 0800 | AT_IC | 85 | 2025-08-20 |
+
+> Diese Kunden erhalten **seit ihrem ersten Rechnungsdatum keine Rechnung per E-Mail** — nicht weil der Purpose falsch ist, sondern weil er vollständig fehlt. Sie wurden möglicherweise nie für den elektronischen Rechnungsversand konfiguriert.
+
+---
+
+### Gesamtübersicht: Drei Problemkategorien
+
+| Kategorie | Identifiziert in | Beschreibung | Maßnahme |
+|-----------|-----------------|--------------|----------|
+| **Falscher Purpose** (KRITISCH) | Schritt 3 | `eInvoice` ohne Suffix, kein korrekter parallel | Purpose umbenennen |
+| **Falscher Purpose** (Bereinigen) | Schritt 3 | `eInvoice` ohne Suffix, korrekter existiert parallel | Falschen Eintrag löschen |
+| **Fehlender Purpose** | Schritt 4 | Rechnungen vorhanden, kein `eInvoice_XXXX` | Purpose neu anlegen |
+
+---
+
+## Schritt 5 – Korrektur-SQL
+
+> **Hinweis:** In D365FO-SQL-Datenbanken ist `DIRPARTYCONTACTENTITY` eine virtuelle Entität.  
+> Die tatsächliche Tabelle, die den `PURPOSE`-Wert speichert, ist **`LOGISTICSELECTRONICADDRESS`**.  
+> Die Verbindung zur Party (Kundennummer) läuft über **`DIRPARTYLOCATION`**.
+
+### Tabellenstruktur (Referenz)
+
+```
+CUSTCUSTOMERENTITY.PARTYNUMBER
+    → DIRPARTYLOCATION.PARTY        (Party → physischer Kontakteintrag)
+    → LOGISTICSELECTRONICADDRESS.LOCATION  (enthält: LOCATOR, TYPE, PURPOSE)
+```
+
+---
+
+### Schritt 5a – Vorschau: Was wird geändert? (immer zuerst ausführen)
+
+Vor jeder Änderung sicherstellen, was betroffen ist:
+
+```{sql connection=cnn}
+-- Vorschau: Bereinigen-Fall (korrekter Purpose existiert bereits → DELETE)
+SELECT
+    dpl.PARTY,
+    c.CUSTOMERACCOUNT,
+    c.DATAAREAID,
+    ct.CUSTGROUP,
+    lea.PURPOSE             AS Purpose_wird_geloescht,
+    lea.LOCATOR             AS EmailAdresse
+FROM LOGISTICSELECTRONICADDRESS lea
+    INNER JOIN DIRPARTYLOCATION dpl
+        ON  dpl.LOCATION  = lea.LOCATION
+    INNER JOIN CUSTCUSTOMERENTITY c
+        ON  c.PARTYNUMBER = dpl.PARTY
+    INNER JOIN CUSTTABLE ct
+        ON  ct.ACCOUNTNUM  = c.CUSTOMERACCOUNT
+        AND ct.DATAAREAID  = c.DATAAREAID
+WHERE lea.TYPE    = 2
+  AND lea.PURPOSE = 'eInvoice'
+  AND ct.CUSTGROUP NOT LIKE '%IC'       -- Intercompany-Kunden ausgeschlossen
+  -- Korrekter Purpose existiert parallel
+  AND EXISTS (
+      SELECT 1
+      FROM LOGISTICSELECTRONICADDRESS lea2
+          INNER JOIN DIRPARTYLOCATION dpl2
+              ON dpl2.LOCATION = lea2.LOCATION
+      WHERE dpl2.PARTY    = dpl.PARTY
+        AND lea2.TYPE      = 2
+        AND lea2.PURPOSE   = CONCAT('eInvoice_', c.DATAAREAID)
+  )
+ORDER BY c.DATAAREAID, c.CUSTOMERACCOUNT;
+```
+
+```{sql connection=cnn}
+-- Vorschau: KRITISCH-Fall (kein korrekter Purpose vorhanden → UPDATE)
+SELECT
+    dpl.PARTY,
+    c.CUSTOMERACCOUNT,
+    c.DATAAREAID,
+    ct.CUSTGROUP,
+    lea.PURPOSE                         AS Purpose_Alt,
+    CONCAT('eInvoice_', c.DATAAREAID)  AS Purpose_Neu,
+    lea.LOCATOR                         AS EmailAdresse
+FROM LOGISTICSELECTRONICADDRESS lea
+    INNER JOIN DIRPARTYLOCATION dpl
+        ON  dpl.LOCATION  = lea.LOCATION
+    INNER JOIN CUSTCUSTOMERENTITY c
+        ON  c.PARTYNUMBER = dpl.PARTY
+    INNER JOIN CUSTTABLE ct
+        ON  ct.ACCOUNTNUM  = c.CUSTOMERACCOUNT
+        AND ct.DATAAREAID  = c.DATAAREAID
+WHERE lea.TYPE    = 2
+  AND lea.PURPOSE = 'eInvoice'
+  AND ct.CUSTGROUP NOT LIKE '%IC'
+  AND NOT EXISTS (
+      SELECT 1
+      FROM LOGISTICSELECTRONICADDRESS lea2
+          INNER JOIN DIRPARTYLOCATION dpl2
+              ON dpl2.LOCATION = lea2.LOCATION
+      WHERE dpl2.PARTY    = dpl.PARTY
+        AND lea2.TYPE      = 2
+        AND lea2.PURPOSE   = CONCAT('eInvoice_', c.DATAAREAID)
+  )
+ORDER BY c.DATAAREAID, c.CUSTOMERACCOUNT;
+```
+
+---
+
+### Schritt 5b – DELETE: Bereinigen-Fall
+
+Wenn der korrekte `eInvoice_XXXX`-Eintrag bereits existiert, ist `eInvoice` ein Duplikat — es kann gelöscht werden.
+
+```{sql connection=cnn}
+-- WICHTIG: Vorschau (5a) vorher ausführen und Ergebnis prüfen!
+DELETE lea
+FROM LOGISTICSELECTRONICADDRESS lea
+    INNER JOIN DIRPARTYLOCATION dpl
+        ON  dpl.LOCATION  = lea.LOCATION
+    INNER JOIN CUSTCUSTOMERENTITY c
+        ON  c.PARTYNUMBER = dpl.PARTY
+    INNER JOIN CUSTTABLE ct
+        ON  ct.ACCOUNTNUM  = c.CUSTOMERACCOUNT
+        AND ct.DATAAREAID  = c.DATAAREAID
+WHERE lea.TYPE    = 2
+  AND lea.PURPOSE = 'eInvoice'
+  AND ct.CUSTGROUP NOT LIKE '%IC'
+  AND EXISTS (
+      SELECT 1
+      FROM LOGISTICSELECTRONICADDRESS lea2
+          INNER JOIN DIRPARTYLOCATION dpl2
+              ON dpl2.LOCATION = lea2.LOCATION
+      WHERE dpl2.PARTY    = dpl.PARTY
+        AND lea2.TYPE      = 2
+        AND lea2.PURPOSE   = CONCAT('eInvoice_', c.DATAAREAID)
+  );
+```
+
+---
+
+### Schritt 5c – UPDATE: KRITISCH-Fall (einzelne Gesellschaft)
+
+Wenn **kein** korrekter Purpose existiert, muss `eInvoice` direkt umbenannt werden.
+
+> **Achtung — Cross-Company Data Sharing:**  
+> Ein `LOGISTICSELECTRONICADDRESS`-Eintrag gehört einer **Party**, nicht einer Gesellschaft.  
+> Wenn der Kunde in mehreren Gesellschaften aktiv ist (z.B. 0900 und 0800), deckt ein einziger UPDATE auf `eInvoice_0900` nur eine Gesellschaft ab. Für 0800 müsste ein **zweiter Eintrag** (`eInvoice_0800`) **neu angelegt** werden.  
+> Daher: UPDATE nur dann, wenn der Kunde nachweislich nur in einer Gesellschaft aktiv ist.
+
+**Schritt 5c-1 — Prüfen: Kunden, die wirklich nur in einer Gesellschaft Rechnungen haben:**
+
+```{sql connection=cnn}
+SELECT
+    inv.ORDERACCOUNT,
+    COUNT(DISTINCT inv.DATAAREAID)      AS Anzahl_Gesellschaften,
+    STRING_AGG(inv.DATAAREAID, ', ')    AS Gesellschaften
+FROM CUSTINVOICEJOUR inv
+WHERE inv.ORDERACCOUNT IN (
+    -- KRITISCH-Kandidaten aus Schritt 3 (ohne IC-Kunden)
+    SELECT DISTINCT c.CUSTOMERACCOUNT
+    FROM LOGISTICSELECTRONICADDRESS lea
+        INNER JOIN DIRPARTYLOCATION dpl ON dpl.LOCATION = lea.LOCATION
+        INNER JOIN CUSTCUSTOMERENTITY c ON c.PARTYNUMBER = dpl.PARTY
+        INNER JOIN CUSTTABLE ct
+            ON  ct.ACCOUNTNUM = c.CUSTOMERACCOUNT
+            AND ct.DATAAREAID = c.DATAAREAID
+    WHERE lea.TYPE = 2 AND lea.PURPOSE = 'eInvoice'
+      AND ct.CUSTGROUP NOT LIKE '%IC'
+      AND NOT EXISTS (
+          SELECT 1
+          FROM LOGISTICSELECTRONICADDRESS lea2
+              INNER JOIN DIRPARTYLOCATION dpl2 ON dpl2.LOCATION = lea2.LOCATION
+          WHERE dpl2.PARTY = dpl.PARTY AND lea2.TYPE = 2
+            AND lea2.PURPOSE = CONCAT('eInvoice_', c.DATAAREAID)
+      )
+)
+GROUP BY inv.ORDERACCOUNT
+ORDER BY Anzahl_Gesellschaften DESC;
+```
+
+**Schritt 5c-2 — UPDATE (nur Eingesellschaft-Kunden):**
+
+```{sql connection=cnn}
+-- Pro Gesellschaft ausführen, z.B. für DATAAREAID = '0900':
+UPDATE lea
+SET    lea.PURPOSE = 'eInvoice_0900'
+FROM LOGISTICSELECTRONICADDRESS lea
+    INNER JOIN DIRPARTYLOCATION dpl
+        ON  dpl.LOCATION  = lea.LOCATION
+    INNER JOIN CUSTCUSTOMERENTITY c
+        ON  c.PARTYNUMBER = dpl.PARTY
+       AND  c.DATAAREAID  = '0900'
+    INNER JOIN CUSTTABLE ct
+        ON  ct.ACCOUNTNUM  = c.CUSTOMERACCOUNT
+        AND ct.DATAAREAID  = '0900'
+WHERE lea.TYPE    = 2
+  AND lea.PURPOSE = 'eInvoice'
+  AND ct.CUSTGROUP NOT LIKE '%IC'
+  AND NOT EXISTS (
+      SELECT 1
+      FROM LOGISTICSELECTRONICADDRESS lea2
+          INNER JOIN DIRPARTYLOCATION dpl2
+              ON dpl2.LOCATION = lea2.LOCATION
+      WHERE dpl2.PARTY    = dpl.PARTY
+        AND lea2.TYPE      = 2
+        AND lea2.PURPOSE   = 'eInvoice_0900'
+  );
+-- Gleichen Block für '0800', '0700' etc. wiederholen
+```
+
+---
+
+### Schritt 5d – Validierung nach der Korrektur
+
+Nach dem DELETE/UPDATE sicherstellen, dass keine `eInvoice`-Einträge mehr existieren:
+
+```{sql connection=cnn}
+SELECT
+    c.DATAAREAID,
+    COUNT(*)    AS Verbleibende_Eintraege
+FROM LOGISTICSELECTRONICADDRESS lea
+    INNER JOIN DIRPARTYLOCATION dpl
+        ON  dpl.LOCATION  = lea.LOCATION
+    INNER JOIN CUSTCUSTOMERENTITY c
+        ON  c.PARTYNUMBER = dpl.PARTY
+    INNER JOIN CUSTTABLE ct
+        ON  ct.ACCOUNTNUM  = c.CUSTOMERACCOUNT
+        AND ct.DATAAREAID  = c.DATAAREAID
+WHERE lea.TYPE    = 2
+  AND lea.PURPOSE = 'eInvoice'
+  AND ct.CUSTGROUP NOT LIKE '%IC'
+GROUP BY c.DATAAREAID
+ORDER BY c.DATAAREAID;
+-- Ziel: kein Ergebnis (0 Zeilen) — für reguläre Kunden
+```
+
+---
+
+## Schritt 6 – Pflegevorgabe: Verbindliche Verwendungszwecke je Gesellschaft
+
+### Grundregel
+
+> Für jede Gesellschaft, in der ein Kunde **Rechnungen per E-Mail** erhalten soll, muss genau **ein** E-Mail-Eintrag mit dem Verwendungszweck `eInvoice_XXXX` existieren.  
+> Der generische Wert `eInvoice` (ohne Suffix) darf **nicht** verwendet werden.
+
+---
+
+### Konvention: Verwendungszweck-Namensschema
+
+| Gesellschaft | Pflicht-Verwendungszweck | Beispiel |
+|-------------|--------------------------|---------|
+| 0500 | `eInvoice_0500` | E-Mail für Rechnungen aus Gesellschaft 0500 |
+| 0600 | `eInvoice_0600` | E-Mail für Rechnungen aus Gesellschaft 0600 |
+| 0700 | `eInvoice_0700` | E-Mail für Rechnungen aus Gesellschaft 0700 |
+| 0800 | `eInvoice_0800` | E-Mail für Rechnungen aus Gesellschaft 0800 |
+| 0900 | `eInvoice_0900` | E-Mail für Rechnungen aus Gesellschaft 0900 |
+
+Für jede weitere Gesellschaft gilt: `eInvoice_` + `DATAAREAID`.
+
+---
+
+### Prozess: Wann wird welcher Eintrag angelegt?
+
+#### Neukunde anlegen
+
+Beim Anlegen eines Kunden in einer Gesellschaft muss **gleichzeitig** der zugehörige E-Mail-Eintrag mit dem gesellschaftsspezifischen Verwendungszweck gepflegt werden:
+
+1. Kunden in D365 anlegen (z.B. in Gesellschaft **0900**)
+2. Kontaktdaten → E-Mail-Adresse hinzufügen
+3. Verwendungszweck setzen: **`eInvoice_0900`**
+4. Beschreibung: `Rechnung per E-Mail – 0900` (empfohlen, für Lesbarkeit)
+
+> Da Kundenstammdaten via Cross-Company Data Sharing automatisch in alle anderen Gesellschaften repliziert werden, sind dort **keine weiteren Schritte** notwendig — sofern der Kunde in diesen Gesellschaften nicht aktiv bestellt.
+
+#### Kunde beginnt in einer weiteren Gesellschaft zu bestellen
+
+Wenn ein bestehender Kunde erstmals in einer weiteren Gesellschaft (z.B. **0800**) Rechnungen erhalten soll:
+
+1. Zusätzlichen E-Mail-Eintrag bei **derselben Party** anlegen
+2. Verwendungszweck: **`eInvoice_0800`**
+3. Der Eintrag wird automatisch in alle Mandanten repliziert
+
+> Es dürfen dabei **keine bestehenden Einträge** (`eInvoice_0900`) verändert werden. Jede Gesellschaft bekommt ihren eigenen Eintrag.
+
+---
+
+### Was ist verboten
+
+| Verbotener Wert | Warum |
+|-----------------|-------|
+| `eInvoice` | Generischer Wert ohne Suffix — wird von keiner Druckverwaltung gefunden |
+| `eRechnung` | Abweichende Schreibweise — kein Treffer in der Druckverwaltung |
+| *(leer)* | Kein Verwendungszweck → Eintrag wird beim Versand ignoriert |
+
+---
+
+### Checkliste bei der Kundenpflege
+
+```
+☐ E-Mail-Adresse für Rechnungsversand vorhanden?
+☐ Verwendungszweck gesetzt?
+☐ Format: eInvoice_ + Gesellschaftskürzel (z.B. eInvoice_0900)?
+☐ Kein generisches "eInvoice" ohne Suffix?
+☐ Für jede Gesellschaft mit aktivem Rechnungsversand einen eigenen Eintrag?
+```
+
+---
+
+### Regelmäßige Qualitätskontrolle (SQL)
+
+Diese Abfrage sollte **monatlich** ausgeführt werden, um neu entstandene Fehlkonfigurationen früh zu erkennen:
+
+```{sql connection=cnn}
+-- Übersicht: Fehlerhafte eInvoice-Einträge je Gesellschaft (reguläre Kunden)
+SELECT
+    c.DATAAREAID,
+    COUNT(DISTINCT c.CUSTOMERACCOUNT)   AS Betroffene_Kunden,
+    COUNT(*)                            AS Fehlerhafte_Eintraege,
+    GETDATE()                           AS Pruefzeitpunkt
+FROM DIRPARTYCONTACTENTITY  d
+    INNER JOIN CUSTCUSTOMERENTITY c
+        ON  d.PARTYNUMBER  = c.PARTYNUMBER
+    INNER JOIN CUSTTABLE ct
+        ON  ct.ACCOUNTNUM  = c.CUSTOMERACCOUNT
+        AND ct.DATAAREAID  = c.DATAAREAID
+WHERE d.TYPE    = 2
+  AND d.PURPOSE = 'eInvoice'
+  AND ct.CUSTGROUP NOT LIKE '%IC'
+GROUP BY
+    c.DATAAREAID
+ORDER BY
+    c.DATAAREAID;
+-- Ziel: kein Ergebnis (0 Zeilen in allen Gesellschaften)
+```
+
+---
+
+## Gesamtüberblick: Analyse- und Korrekturprozess
+
+| Schritt | Zweck | Maßnahme |
+|---------|-------|----------|
+| **1** | Alle `eInvoice`-Einträge finden | SELECT auf `DIRPARTYCONTACTENTITY` |
+| **2** | Umfang je Gesellschaft | GROUP BY `DATAAREAID` |
+| **3** | Kritikalität bewerten | LEFT JOIN auf `eInvoice_XXXX` → KRITISCH vs. Bereinigen |
+| **4** | Lücken finden | Kunden mit Rechnungen, aber ohne jeglichen Purpose |
+| **5** | Korrigieren | DELETE (Bereinigen) / UPDATE (KRITISCH) auf `LOGISTICSELECTRONICADDRESS` |
+| **6** | Nachhaltig sichern | Pflegevorgabe + monatliche Kontrollabfrage |
+
+---
+
+## Nächste Schritte
+
+| Schritt | Beschreibung | Status |
+|---------|-------------|--------|
+| **Analyse** | Kunden mit falschem `eInvoice`-Purpose (Schritt 1–3) | ✓ *erledigt* |
+| **Lückenanalyse** | Kunden mit Rechnungen aber ohne Purpose (Schritt 4) | ✓ *erledigt* |
+| **Korrektur** | DELETE/UPDATE für fehlerhafte `eInvoice`-Einträge (Schritt 5) | ✓ *erledigt* |
+| **Pflegevorgabe** | Definition verbindlicher Verwendungszwecke (Schritt 6) | ✓ *erledigt* |
+
+---
+
+*Erstellt: 2026-09-04 | D365 Systemadministration — Verwendungszweck E-Mail Rechnungsversand*
