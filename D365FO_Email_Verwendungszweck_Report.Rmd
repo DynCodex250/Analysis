@@ -1,4 +1,4 @@
----
+﻿---
 title: "Rechnungs-E-Mail: Analyse fehlerhafter Verwendungszwecke"
 subtitle: "Analysebericht – D365FO Systemadministration"
 author: "Cedric Kameni"
@@ -29,6 +29,52 @@ library(openxlsx)
 
 ---
 
+> 📦 **Datengrundlage: Kontaktdaten aus PROD-Umgebung**
+> Die Partei-Kontaktdaten (`PartyContactsExport`) wurden aus der **PROD-Umgebung** exportiert
+> und in die TST-Datenbank geladen, da Microsoft in Testumgebungen alle E-Mail-Adressen
+> aus Datenschutzgründen entfernt. Alle Analyseergebnisse basieren auf echten PROD-Daten.
+
+---
+
+## Datengrundlage
+
+### Warum nicht direkt aus TST?
+
+Microsoft entfernt in Sandbox- und Testumgebungen (TST) systematisch alle persönlichen Kontaktdaten aus `DIRPARTYCONTACTENTITY`. Eine direkte Analyse gegen TST würde daher leere Ergebnisse liefern.
+
+### Prozess: PROD-Daten in TST laden
+
+Um dennoch eine valide Analyse durchzuführen, werden die Party-Kontaktdaten aus der PROD-Umgebung exportiert und als eigenständige Tabelle in TST bereitgestellt:
+
+**Schritt 1 — Export aus PROD (Dynamics 365 Data Management):**
+
+- Entität: **Party contacts V3** (`DIRPARTYCONTACTENTITY`)
+- Format: Excel (`.xlsx`)
+- Umgebung: PROD
+
+**Schritt 2 — Import in TST-Datenbank (R):**
+
+```r
+# PROD-Export einlesen
+PartyContactsExport <- readxl::read_excel(
+  "C:/Users/CKAM/Documents/RProjects/PartyContactsExport.xlsx"
+)
+
+# In TST-SQL-Server schreiben
+odbc::dbWriteTable(
+  cnn,
+  name      = "PartyContactsExport",
+  value     = PartyContactsExport,
+  overwrite = TRUE
+)
+```
+
+Die Tabelle `PartyContactsExport` steht danach in TST zur Verfügung und enthält die echten PROD-Kontaktdaten. Sie ersetzt in allen nachfolgenden Abfragen die systemseitige `DIRPARTYCONTACTENTITY`.
+
+> ⚠️ **Hinweis:** Dieser Schritt muss vor dem Knitten dieses Dokuments manuell ausgeführt werden, wenn neue PROD-Daten benötigt werden.
+
+---
+
 ## Hintergrund
 
 Ein Kunde hat keine Rechnung per E-Mail erhalten, obwohl eine E-Mail-Adresse im System hinterlegt war. Die Ursache: Der hinterlegte **Verwendungszweck** (`PURPOSE`) lautete `eInvoice` — ohne Gesellschaftssuffix.
@@ -48,7 +94,7 @@ SELECT
     c.DATAAREAID,
     COUNT(DISTINCT c.CUSTOMERACCOUNT)   AS Betroffene_Kunden,
     COUNT(*)                            AS Betroffene_Eintraege
-FROM DIRPARTYCONTACTENTITY  d
+FROM PartyContactsExport  d
     INNER JOIN CUSTCUSTOMERENTITY c
         ON  d.PARTYNUMBER  = c.PARTYNUMBER
     INNER JOIN CUSTTABLE ct
@@ -76,11 +122,11 @@ FROM CUSTCUSTOMERENTITY c
     INNER JOIN CUSTTABLE ct
         ON  ct.ACCOUNTNUM  = c.CUSTOMERACCOUNT
         AND ct.DATAAREAID  = c.DATAAREAID
-    INNER JOIN DIRPARTYCONTACTENTITY d_falsch
+    INNER JOIN PartyContactsExport d_falsch
         ON  d_falsch.PARTYNUMBER = c.PARTYNUMBER
         AND d_falsch.TYPE        = 2
         AND d_falsch.PURPOSE     = 'eInvoice'
-    LEFT JOIN DIRPARTYCONTACTENTITY d_korrekt
+    LEFT JOIN PartyContactsExport d_korrekt
         ON  d_korrekt.PARTYNUMBER = c.PARTYNUMBER
         AND d_korrekt.TYPE        = 2
         AND d_korrekt.PURPOSE     = CONCAT('eInvoice_', c.DATAAREAID)
@@ -102,7 +148,7 @@ FROM CUSTINVOICEJOUR inv
     INNER JOIN CUSTCUSTOMERENTITY c
         ON  c.CUSTOMERACCOUNT = inv.ORDERACCOUNT
         AND c.DATAAREAID      = inv.DATAAREAID
-    LEFT JOIN DIRPARTYCONTACTENTITY d_email
+    LEFT JOIN PartyContactsExport d_email
         ON  d_email.PARTYNUMBER = c.PARTYNUMBER
         AND d_email.TYPE        = 2
         AND d_email.PURPOSE     = CONCAT('eInvoice_', inv.DATAAREAID)
@@ -125,7 +171,7 @@ FROM CUSTINVOICEJOUR inv
     INNER JOIN CUSTCUSTOMERENTITY c
         ON  c.CUSTOMERACCOUNT = inv.ORDERACCOUNT
         AND c.DATAAREAID      = inv.DATAAREAID
-    LEFT JOIN DIRPARTYCONTACTENTITY d_email
+    LEFT JOIN PartyContactsExport d_email
         ON  d_email.PARTYNUMBER = c.PARTYNUMBER
         AND d_email.TYPE        = 2
         AND d_email.PURPOSE     = CONCAT('eInvoice_', inv.DATAAREAID)
