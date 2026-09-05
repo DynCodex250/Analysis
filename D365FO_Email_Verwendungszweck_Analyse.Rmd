@@ -79,11 +79,20 @@ Intercompany-Kunden sind konzerninterne Verrechnungspartner. Sie nehmen **nicht*
 
 ---
 
+## Datenbankverbindung
+
+```{r setup, include=FALSE}
+cred_path <- ""
+cnn <- D365Security::get_connection("TST", cred_path)
+```
+
+---
+
 ## Schritt 1 – Alle Kunden mit generischem `eInvoice`-Verwendungszweck
 
 Diese Abfrage findet alle E-Mail-Einträge, bei denen der Verwendungszweck **exakt** `eInvoice` lautet — ohne Gesellschaftssuffix.
 
-```{sql connection=cnn}
+```{sql connection=cnn, output.var="df_einvoice_falsch"}
 SELECT
     c.CUSTOMERACCOUNT,
     c.DATAAREAID,
@@ -112,7 +121,7 @@ ORDER BY
 
 ## Schritt 2 – Zusammenfassung: Wie viele betroffene Kunden je Gesellschaft?
 
-```{sql connection=cnn}
+```{sql connection=cnn, output.var="df_zusammenfassung"}
 SELECT
     c.DATAAREAID,
     COUNT(DISTINCT c.CUSTOMERACCOUNT)   AS Betroffene_Kunden,
@@ -143,7 +152,7 @@ Dies ist die wichtigste Abfrage. Sie unterscheidet zwischen zwei Szenarien:
 | **Kritisch** | `NULL` | Kunde hat **nur** `eInvoice` — erhält garantiert keine Rechnung per E-Mail |
 | **Bereinigen** | `eInvoice_XXXX` | Kunde hat **beide** — der korrekte Purpose existiert, `eInvoice` ist ein Überbleibsel |
 
-```{sql connection=cnn}
+```{sql connection=cnn, output.var="df_kritikalitaet"}
 SELECT
     c.CUSTOMERACCOUNT,
     c.DATAAREAID,
@@ -226,7 +235,7 @@ Erkennungsmerkmal: `CUSTTABLE.CUSTGROUP` endet mit dem Suffix `IC` (z.B. `DE_IC`
 
 IC-Kunden (`CUSTGROUP LIKE '%IC'`) werden ausgeschlossen.
 
-```{sql connection=cnn}
+```{sql connection=cnn, output.var="df_luecken_regulaer"}
 SELECT
     inv.ORDERACCOUNT                    AS CUSTOMERACCOUNT,
     inv.DATAAREAID,
@@ -270,7 +279,7 @@ ORDER BY
 
 ### Schritt 4b – Fokus: Reguläre Kunden aktiv in den letzten 12 Monaten
 
-```{sql connection=cnn}
+```{sql connection=cnn, output.var="df_luecken_aktiv_12m"}
 SELECT
     inv.ORDERACCOUNT                    AS CUSTOMERACCOUNT,
     inv.DATAAREAID,
@@ -315,7 +324,7 @@ ORDER BY
 
 Diese Abfrage zeigt Intercompany-Kunden ohne `eInvoice_XXXX`-Purpose. Der fehlende Eintrag ist bei IC-Kunden **bewusst und korrekt** — die Abfrage dient nur zur Transparenz und Dokumentation.
 
-```{sql connection=cnn}
+```{sql connection=cnn, output.var="df_luecken_ic"}
 SELECT
     inv.ORDERACCOUNT                    AS CUSTOMERACCOUNT,
     inv.DATAAREAID,
@@ -405,7 +414,7 @@ CUSTCUSTOMERENTITY.PARTYNUMBER
 
 Vor jeder Änderung sicherstellen, was betroffen ist:
 
-```{sql connection=cnn}
+```{sql connection=cnn, output.var="df_preview_bereinigen"}
 -- Vorschau: Bereinigen-Fall (korrekter Purpose existiert bereits → DELETE)
 SELECT
     dpl.PARTY,
@@ -438,7 +447,7 @@ WHERE lea.TYPE    = 2
 ORDER BY c.DATAAREAID, c.CUSTOMERACCOUNT;
 ```
 
-```{sql connection=cnn}
+```{sql connection=cnn, output.var="df_preview_kritisch"}
 -- Vorschau: KRITISCH-Fall (kein korrekter Purpose vorhanden → UPDATE)
 SELECT
     dpl.PARTY,
@@ -477,7 +486,7 @@ ORDER BY c.DATAAREAID, c.CUSTOMERACCOUNT;
 
 Wenn der korrekte `eInvoice_XXXX`-Eintrag bereits existiert, ist `eInvoice` ein Duplikat — es kann gelöscht werden.
 
-```{sql connection=cnn}
+```{sql connection=cnn, output.var="n_delete_bereinigen"}
 -- WICHTIG: Vorschau (5a) vorher ausführen und Ergebnis prüfen!
 DELETE lea
 FROM LOGISTICSELECTRONICADDRESS lea
@@ -515,7 +524,7 @@ Wenn **kein** korrekter Purpose existiert, muss `eInvoice` direkt umbenannt werd
 
 **Schritt 5c-1 — Prüfen: Kunden, die wirklich nur in einer Gesellschaft Rechnungen haben:**
 
-```{sql connection=cnn}
+```{sql connection=cnn, output.var="df_pruefung_gesellschaften"}
 SELECT
     inv.ORDERACCOUNT,
     COUNT(DISTINCT inv.DATAAREAID)      AS Anzahl_Gesellschaften,
@@ -546,7 +555,7 @@ ORDER BY Anzahl_Gesellschaften DESC;
 
 **Schritt 5c-2 — UPDATE (nur Eingesellschaft-Kunden):**
 
-```{sql connection=cnn}
+```{sql connection=cnn, output.var="n_update_kritisch"}
 -- Pro Gesellschaft ausführen, z.B. für DATAAREAID = '0900':
 UPDATE lea
 SET    lea.PURPOSE = 'eInvoice_0900'
@@ -580,7 +589,7 @@ WHERE lea.TYPE    = 2
 
 Nach dem DELETE/UPDATE sicherstellen, dass keine `eInvoice`-Einträge mehr existieren:
 
-```{sql connection=cnn}
+```{sql connection=cnn, output.var="df_validierung"}
 SELECT
     c.DATAAREAID,
     COUNT(*)    AS Verbleibende_Eintraege
@@ -676,7 +685,7 @@ Wenn ein bestehender Kunde erstmals in einer weiteren Gesellschaft (z.B. **0800*
 
 Diese Abfrage sollte **monatlich** ausgeführt werden, um neu entstandene Fehlkonfigurationen früh zu erkennen:
 
-```{sql connection=cnn}
+```{sql connection=cnn, output.var="df_kontrolle_monatlich"}
 -- Übersicht: Fehlerhafte eInvoice-Einträge je Gesellschaft (reguläre Kunden)
 SELECT
     c.DATAAREAID,
