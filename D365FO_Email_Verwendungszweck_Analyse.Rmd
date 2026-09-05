@@ -5,9 +5,23 @@ output:
 ---
 # D365FO – Prüfung der Verwendungszwecke von Rechnungs-E-Mail-Adressen
 
-**Autor:** Cedric Kameni  
-**Bereich:** D365 Systemadministration  
+**Autor:** Cedric Kameni
+**Bereich:** D365 Systemadministration
 **Hintergrund:** Analyse nach Supportfall — Kunde erhielt keine Rechnung per E-Mail trotz vorhandener E-Mail-Adresse
+
+---
+
+> 🔬 **Dieses Dokument: Technische Analysegrundlage (TST-Umgebung)**
+>
+> Dieses Dokument dokumentiert die **Analyselogik und SQL-Abfragen** für die Entwicklung und Validierung.
+> Es läuft gegen die **TST-Umgebung** — dort sind E-Mail-Adressen und Kontaktdaten (`DIRPARTYCONTACTENTITY`)
+> von Microsoft aus Datenschutzgründen **standardmäßig leer**. SQL-Abfragen können daher in TST
+> keine oder unvollständige Ergebnisse liefern.
+>
+> | | |
+> |-|-|
+> | **Analysedokument** *(dieses Dokument)* | TST-Umgebung · Kontaktdaten leer · Logik- und Strukturvalidierung |
+> | **Berichtsdokument** (`D365FO_Email_Verwendungszweck_Report.Rmd`) | PROD-Daten via `PartyContactsExport` · echte Ergebnisse für Stakeholder |
 
 ---
 
